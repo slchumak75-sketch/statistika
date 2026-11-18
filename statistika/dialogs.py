@@ -117,26 +117,29 @@ class CatalogDialog(Modal):
         self.rule_group.current(0)
         self.rule_group.pack(side="left", padx=8)
         self.rule_group.bind("<<ComboboxSelected>>", self._switch_group)
-        self.restore_button = ttk.Button(choice, text="Исходные фразы", command=self.restore_rule, state="disabled")
-        self.restore_button.pack(side="right")
+        self.rule_description = tk.StringVar(master=self)
+        description = ttk.Label(
+            parent, textvariable=self.rule_description, style="Muted.TLabel", wraplength=680, anchor="w", justify="left",
+        )
+        description.pack(fill="x", pady=(0, 10))
+        parent.bind("<Configure>", lambda event: description.configure(wraplength=max(250, event.width - 24)))
         self.rule_editor = RuleEditor(parent, catalog)
         self.rule_editor.pack(fill="both", expand=True)
+        self._describe_group()
 
     def _selected_group(self) -> int | None:
         index = self.rule_group.current()
         return GROUPS[index - 1] if index > 0 else None
 
-    def _switch_group(self, _event=None) -> None:
+    def _describe_group(self) -> None:
         group = self._selected_group()
-        self.restore_button.state(["disabled" if group is None else "!disabled"])
-        self.rule_editor.show_group(group)
+        self.rule_description.set(
+            self.rule_editor.catalog.label(group) if group is not None else "Выберите группу, чтобы увидеть описание и включить фразу."
+        )
 
-    def restore_rule(self) -> None:
-        group = self._selected_group()
-        if group is not None and messagebox.askyesno(
-            "Восстановить фразы?", "Заменить правила выбранной группы исходным списком?", parent=self,
-        ):
-            self.rule_editor.restore_group(group)
+    def _switch_group(self, _event=None) -> None:
+        self._describe_group()
+        self.rule_editor.show_group(self._selected_group())
 
     def _read_points(self) -> dict[int, str]:
         text = self.points_text.get("1.0", "end-1c")
@@ -157,6 +160,7 @@ class CatalogDialog(Modal):
         self.rule_group.configure(values=self._group_values(catalog))
         self.rule_group.current(index)
         self.rule_editor.update_catalog(catalog)
+        self._describe_group()
 
     def restore_points(self) -> None:
         if not messagebox.askyesno(

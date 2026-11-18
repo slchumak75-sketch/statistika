@@ -616,15 +616,29 @@ def _self_test(marker: Path) -> int:
                 root.update()
                 editor = catalog_editor.rule_editor
                 assert editor.tree["columns"] == ("enabled", "phrase", "exclude", "delete")
+                assert editor.tree.heading("exclude", "text") == "Исключение"
+                assert not hasattr(editor, "group") and not hasattr(catalog_editor, "restore_button")
                 editor.query.set("ГЕЛЬ")
                 assert {"57", "63"} <= {item.split(":")[0] for item in editor.tree.get_children()}
                 catalog_editor.rule_group.current(1 + GROUPS.index(57))
                 catalog_editor.rule_group.event_generate("<<ComboboxSelected>>")
                 root.update()
                 assert {item.split(":")[0] for item in editor.tree.get_children() if ":" in item} == {"57"}
+                assert catalog_editor.rule_description.get() == app.catalog.label(57)
                 catalog_editor.rule_group.current(0)
                 catalog_editor.rule_group.event_generate("<<ComboboxSelected>>")
                 root.update()
+
+                editor.phrase.insert(0, "Фраза без группы CI")
+                with patch.object(messagebox, "showwarning") as warning:
+                    assert not editor.include_phrase()
+                    warning.assert_called_once()
+                assert not editor.rules
+                editor.phrase.delete(0, "end")
+                catalog_editor.rule_group.current(1 + GROUPS.index(53))
+                catalog_editor.rule_group.event_generate("<<ComboboxSelected>>")
+                root.update()
+                assert catalog_editor.rule_description.get() == app.catalog.label(53)
 
                 def click_phrase(item: str, column: str) -> None:
                     editor.tree.see(item)
@@ -641,18 +655,18 @@ def _self_test(marker: Path) -> int:
                 click_phrase(rule_item, "enabled")
                 assert editor.tree.set(rule_item, "enabled") == "☐" and editor.rules[53][index].disabled
 
-                editor.group.current(1 + GROUPS.index(53))
                 editor.phrase.insert(0, "Пробная фраза CI")
                 editor.include_button.invoke()
                 enabled_phrase = RecognitionRule("Пробная фраза CI")
                 exclusion = RecognitionRule("Пробная фраза CI", exclude=True)
                 added = f"53:{len(editor.rules[53]) - 1}"
-                assert editor.rules[53][-1] == enabled_phrase and editor.tree.set(added, "exclude") == "Исключение"
+                assert editor.rules[53][-1] == enabled_phrase and editor.tree.set(added, "exclude") == ""
                 click_phrase(added, "exclude")
-                assert editor.rules[53][-1] == exclusion and editor.tree.set(added, "exclude") == "Снять исключение"
+                assert editor.rules[53][-1] == exclusion and editor.tree.set(added, "exclude") == "Исключение"
                 assert editor.tree.set(added, "enabled") == "☑"
+                assert editor.tree.set(added, "phrase") == "Пробная фраза CI"
                 click_phrase(added, "exclude")
-                assert editor.rules[53][-1] == enabled_phrase
+                assert editor.rules[53][-1] == enabled_phrase and editor.tree.set(added, "exclude") == ""
                 click_phrase(added, "exclude")
                 editor.phrase.insert(0, "Временная фраза CI")
                 editor.include_button.invoke()

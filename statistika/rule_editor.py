@@ -22,13 +22,7 @@ _ROW_ACTIONS = {"#1": "enabled", "#3": "exclude", "#4": "delete"}
 
 
 def _row_values(rule: RecognitionRule) -> tuple[str, ...]:
-    label = " · ".join(_terms(rule)) + (" (исключение)" if rule.exclude else "")
-    return ("☐" if rule.disabled else "☑", label, "Снять исключение" if rule.exclude else "Исключение", "Удалить")
-
-
-def _groups_for_add(catalog: Catalog) -> tuple[str, ...]:
-    labels = (catalog.short_label(number) for number in GROUPS)
-    return "Выберите группу", *(label if len(label) <= 46 else label[:45] + "…" for label in labels)
+    return ("☐" if rule.disabled else "☑", " · ".join(_terms(rule)), "Исключение" if rule.exclude else "", "Удалить")
 
 
 class RuleEditor(ttk.Frame):
@@ -53,16 +47,15 @@ class RuleEditor(ttk.Frame):
         self.phrase = ttk.Entry(form)
         self.phrase.grid(row=1, column=0, sticky="ew", padx=(0, 8))
         self.phrase.bind("<Return>", self._enter_phrase)
-        self.group = ttk.Combobox(form, state="readonly", width=29, values=_groups_for_add(catalog))
-        self.group.current(0)
-        self.group.grid(row=1, column=1, sticky="ew", padx=(0, 8))
         self.include_button = ttk.Button(form, text="Включить", command=self.include_phrase)
-        self.include_button.grid(row=1, column=2, sticky="e")
+        self.include_button.grid(row=1, column=1, sticky="e")
 
-        self.tree = ttk.Treeview(self, columns=("enabled", "phrase", "exclude", "delete"), show="", selectmode="browse", height=14)
+        self.tree = ttk.Treeview(self, columns=("enabled", "phrase", "exclude", "delete"), show="headings", selectmode="browse", height=14)
+        self.tree.heading("phrase", text="Фраза", anchor="w")
+        self.tree.heading("exclude", text="Исключение")
         self.tree.column("enabled", width=36, minwidth=36, anchor="center", stretch=False)
         self.tree.column("phrase", width=400, minwidth=190, anchor="w")
-        self.tree.column("exclude", width=155, minwidth=155, anchor="center", stretch=False)
+        self.tree.column("exclude", width=130, minwidth=130, anchor="center", stretch=False)
         self.tree.column("delete", width=85, minwidth=85, anchor="center", stretch=False)
         self.tree.tag_configure("group", background="#e0eaf5", font=("Segoe UI", 9, "bold"))
         self.tree.tag_configure("disabled", foreground="#617488")
@@ -83,20 +76,10 @@ class RuleEditor(ttk.Frame):
         if self.catalog.points == catalog.points:
             return
         self.catalog = catalog
-        index = max(0, self.group.current())
-        self.group.configure(values=_groups_for_add(catalog))
-        self.group.current(index)
         self._refresh(keep_position=True)
 
     def show_group(self, group: int | None) -> None:
         self.visible_group = group
-        if group is not None:
-            self.group.current(1 + GROUPS.index(group))
-        self.group.configure(state="readonly" if group is None else "disabled")
-        self._refresh()
-
-    def restore_group(self, group: int) -> None:
-        self.rules.pop(group, None)
         self._refresh()
 
     def _rules_for(self, number: int) -> tuple[RecognitionRule, ...]:
@@ -139,11 +122,13 @@ class RuleEditor(ttk.Frame):
         if not raw_phrase.strip():
             return True
         phrase = clean_phrase(raw_phrase)
-        selection = self.group.current()
-        if not any(ch.isalnum() for ch in phrase) or selection <= 0:
-            messagebox.showwarning("Включить фразу", "Введите фразу с буквами или цифрами и выберите её группу.", parent=self)
+        number = self.visible_group
+        if number is None:
+            messagebox.showwarning("Включить фразу", "Сначала выберите товарную группу над списком фраз.", parent=self)
             return False
-        number = GROUPS[selection - 1]
+        if not any(ch.isalnum() for ch in phrase):
+            messagebox.showwarning("Включить фразу", "Введите фразу с буквами или цифрами.", parent=self)
+            return False
         rules = list(self._rules_for(number))
         key = _search_key(phrase)
         index = next((i for i, rule in enumerate(rules) if not rule.exclude and key == _search_key(" ".join(_terms(rule)))), None)

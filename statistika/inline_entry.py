@@ -70,7 +70,8 @@ class InlineEntry(ttk.Entry):
         return "break"
 
     def _focus_out(self, _event) -> None:
-        if not self.applying:
+        # Событие закрытой ячейки может прийти после открытия следующей в том же поле.
+        if not self.applying and self.focus_get() is not self:
             self.dismiss()
 
     def _outside_click(self, event) -> None:

@@ -629,9 +629,11 @@ def _check_volume_cells(app: MainWindow, base: Path) -> Path:
         for time in (now, now + 80):
             tree.event_generate("<ButtonPress-1>", x=x + width // 2, y=y + height // 2, time=time)
             tree.event_generate("<ButtonRelease-1>", x=x + width // 2, y=y + height // 2, time=time + 20)
-        root.update()
-        assert entry.item == item and entry.winfo_ismapped()
+            root.update()
+        assert entry.item == item and entry.winfo_ismapped(), f"Не открылась ячейка {item}/{column}: {entry.item!r}"
 
+    tree.focus_force()
+    root.update()
     double_click("name")
     assert entry.instate(["readonly"]) and entry.get() == name
     fragment = "Портер 8/20"

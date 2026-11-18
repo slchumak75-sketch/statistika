@@ -176,3 +176,23 @@ def test_unchanged_builtin_v2_list_can_follow_new_defaults_without_touching_cust
     data["rules"]["53"].append("свой второй термин")
     path.write_text(json.dumps(data), encoding="utf-8")
     assert load_catalog(path).rules[53] == (RecognitionRule("старый термин"), RecognitionRule("свой второй термин"))
+
+
+def test_legacy_v3_flag_is_ignored_without_losing_saved_recognition_conditions(tmp_path):
+    from statistika.classifier import Classifier
+
+    path = tmp_path / "catalog.json"
+    name = "автомат"
+    path.write_text(json.dumps({
+        "version": 3, "points": builtin_catalog().points,
+        "rules": {"53": [{"phrase": name, "at_start": True, "also": ["ва47"], "internal_only": True}], "100": []},
+    }), encoding="utf-8")
+    catalog = load_catalog(path)
+    assert catalog.recognition_rules(53) == (RecognitionRule(name, at_start=True, also=("ва47",)),)
+    classifier = Classifier(catalog)
+    assert classifier.group_for("Автомат ВА47 16А") == 53
+    assert classifier.group_for("Автомат игрушечный") is None
+    assert classifier.group_for("Носки") is None
+    save_catalog(catalog, path)
+    assert "internal_only" not in path.read_text(encoding="utf-8")
+    assert load_catalog(path) == catalog

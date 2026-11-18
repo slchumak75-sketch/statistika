@@ -55,7 +55,6 @@ class RecognitionRule:
     exclude: bool = False
     also: tuple[str, ...] = ()
     also_at_start: tuple[str, ...] = ()
-    internal_only: bool = False
 
 
 def _legacy_rule(line: str) -> RecognitionRule | None:
@@ -77,8 +76,9 @@ def _read_rule(value: object) -> RecognitionRule:
     if not isinstance(value, dict) or not isinstance(value.get("phrase"), str):
         raise ValueError("некорректная фраза распознавания")
     phrase = clean_phrase(value["phrase"])
-    at_start, exclude, internal_only = (value.get(key, False) for key in ("at_start", "exclude", "internal_only"))
-    if not any(ch.isalnum() for ch in phrase) or not all(isinstance(flag, bool) for flag in (at_start, exclude, internal_only)):
+    # Старый флажок internal_only из v3 больше не ограничивает действие фразы.
+    at_start, exclude = (value.get(key, False) for key in ("at_start", "exclude"))
+    if not any(ch.isalnum() for ch in phrase) or not all(isinstance(flag, bool) for flag in (at_start, exclude)):
         raise ValueError("некорректные поля правила")
 
     def extras(key: str) -> tuple[str, ...]:
@@ -87,7 +87,7 @@ def _read_rule(value: object) -> RecognitionRule:
             raise ValueError("некорректные уточнения правила")
         return tuple(clean_phrase(p) for p in phrases)
 
-    return RecognitionRule(phrase, at_start, exclude, extras("also"), extras("also_at_start"), internal_only)
+    return RecognitionRule(phrase, at_start, exclude, extras("also"), extras("also_at_start"))
 
 
 def _write_rule(rule: RecognitionRule) -> dict[str, object]:
@@ -212,8 +212,6 @@ def _read_catalog(path: Path) -> tuple[Catalog, int]:
                 entries = tuple(rule for phrase in phrases if (rule := _legacy_rule(phrase)) is not None)
             else:
                 entries = tuple(_read_rule(rule) for rule in phrases)
-            if int(number) != 53 and any(rule.internal_only for rule in entries):
-                raise ValueError("режим внутренней стройгруппы доступен только для №53")
             rules[int(number)] = entries
         if any(number < 1 or not text for number, text in points.items()):
             raise ValueError("непустое описание и положительный номер обязательны")

@@ -102,8 +102,6 @@ def test_conflicting_custom_alias_leaves_official_match_unassigned():
     ("Жидкие обои 3 кг", 53),
     ("Обои Зара к-91", None),
     ("Ламинат Дуб 33 класс", None),
-    ("Кабель АВВГ-4*16", None),
-    ("Розетка 7-202-01 с/з", None),
 ])
 def test_construction_by_researched_purpose_and_scope(name, expected):
     assert Classifier(builtin_catalog()).group_for(name) == expected
@@ -179,17 +177,16 @@ def test_whole_inventory_audit_adds_context_specific_construction_families(name,
     "Кабель АВВГ-4*16", "Кабель-канал 25*16", "Провод ПВС 3*1,5", "Розетка 7-202-01 с/з",
     "Выключатель 2 клав. 6А бел.Пралеска Аква",
 ])
-def test_electrical_installation_rules_are_opt_in(name):
+def test_recognized_installation_goods_use_the_normal_construction_group(name):
     catalog = builtin_catalog()
-    assert Classifier(catalog).group_for(name) is None
-    assert Classifier(catalog, include_electrical=True).group_for(name) == 53
-    removed = replace(catalog, rules={**catalog.rules, 53: tuple(r for r in catalog.rules[53] if not r.internal_only)})
-    assert Classifier(removed, include_electrical=True).group_for(name) is None
+    assert Classifier(catalog).group_for(name) == 53
+    removed = replace(catalog, rules={**catalog.rules, 53: ()})
+    assert Classifier(removed).group_for(name) is None
 
 
 @pytest.mark.parametrize("name", [
     "Автомат игрушечный", "Автомат для продажи кофе", "Автомат", "Розетка для варенья 100мл",
     "Триммерная головка автомат", "Лампа галог. GU10 50W", "Стиральный порошок автомат", "Ламинат Дуб 33 класс",
 ])
-def test_electrical_addon_does_not_capture_unrelated_homonyms(name):
-    assert Classifier(builtin_catalog(), include_electrical=True).group_for(name) != 53
+def test_construction_rules_do_not_capture_unrelated_homonyms(name):
+    assert Classifier(builtin_catalog()).group_for(name) != 53

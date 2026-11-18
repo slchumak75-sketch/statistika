@@ -144,6 +144,12 @@ def _price(value: object) -> Decimal | None:
     return number if number is not None and number >= 0 else None
 
 
+def _retail_amount(quantity: Decimal | None, price: Decimal | None) -> Decimal | None:
+    if quantity == 0:
+        return Decimal(0)
+    return quantity * price if quantity is not None and price is not None else None
+
+
 def _selection(layout: WarehouseLayout, source: SalesQuantity, month_range: tuple[int, int] | None) -> tuple[MonthColumn, ...]:
     if source != SalesQuantity.MONTHS:
         if month_range is not None:
@@ -167,7 +173,7 @@ def import_warehouse_products(
     # J — один снимок, не история запасов. При раннем конце периода не подставляем поздние остатки.
     use_stock = not months or (months[-1].key == (snapshot.year, snapshot.month) if snapshot else months == layout.months)
     products: list[Product] = []
-    totals = repeats = no_values = unknown_price = 0
+    totals = repeats = no_values = missing_sale_price = missing_stock_price = 0
     outflow = get_column_letter(layout.outflow_column + 1)
     stock = get_column_letter(layout.ending_column + 1)
     price = get_column_letter(layout.price_column + 1)
@@ -199,17 +205,13 @@ def import_warehouse_products(
             # Не подменять пустой месячный показатель нулём, в т. ч. при частичных данных.
             if all(amount is not None for amount in amounts):
                 sold_qty = sum((amount for amount in amounts if amount is not None), Decimal(0))
-        stock_amount = None
-        if ending_qty == 0:
-            stock_amount = Decimal(0)
-        elif ending_qty is not None:
-            retail_price = _price(cell_at(row, layout.price_column))
-            if retail_price is None:
-                unknown_price += 1
-            else:
-                stock_amount = ending_qty * retail_price
+        retail_price = _price(cell_at(row, layout.price_column)) if sold_qty or ending_qty else None
+        sold_amount = _retail_amount(sold_qty, retail_price)
+        stock_amount = _retail_amount(ending_qty, retail_price)
+        missing_sale_price += sold_qty is not None and sold_amount is None
+        missing_stock_price += ending_qty is not None and stock_amount is None
         products.append(Product(
-            name, sold_qty, None, ending_qty, stock_amount,
+            name, sold_qty, sold_amount, ending_qty, stock_amount,
             warehouse=_text(cell_at(row, layout.warehouse_column)),
             unit=normalize_unit(cell_at(row, layout.unit_column)) if layout.unit_column is not None else "",
         ))
@@ -229,23 +231,33 @@ def import_warehouse_products(
         quantity_note = f"«Расход» ({outflow}) за весь период ведомости. Выбран пользователем; может включать не только продажи."
         sales_label = f"{source_period.label} («Расход»)" if source_period else "весь период ведомости («Расход»)"
 
+    summary = []
+    if source == SalesQuantity.UNKNOWN:
+        sales_amount_note = "Не заполнено: не выбран источник количества."
+    else:
+        summary.append(f"Продано, руб. = количество × розничная цена ({price}).")
+        sales_amount_note = (
+            f"Количество за период (столбец C) × розничная цена ({price}) из ведомости. "
+            "Это расчётная сумма, не фактическая выручка. "
+            "При ненулевом количестве без одной числовой цены сумма не рассчитана."
+        )
+        if missing_sale_price:
+            summary.append(f"Без суммы продаж из-за цены: {missing_sale_price} стр.")
+        if source == SalesQuantity.OUTFLOW:
+            summary.append("«Расход» может включать не только продажи.")
+
     if use_stock:
         stock_label = snapshot_label
         stock_quantity_note = f"Конечный остаток ({stock}): {snapshot_label}."
         stock_amount_note = f"Конечное количество ({stock}) × розничная цена ({price}). Без одной числовой цены сумма не рассчитана."
-        summary = f"Суммы продаж в источнике нет. Остаток ({stock} × {price}): без цены или с неоднозначной ценой — {unknown_price} строк."
+        if missing_stock_price:
+            summary.append(f"Суммы остатков без однозначной цены: {missing_stock_price} строк не рассчитано.")
     else:
         stock_label = "нет на конец выбранного периода"
         stock_quantity_note = stock_amount_note = f"Не рассчитано: ведомость содержит только снимок остатков ({snapshot_label})."
-        summary = f"Суммы продаж в источнике нет. Остатки не подставлены: ведомость содержит только снимок ({snapshot_label})."
-    if source == SalesQuantity.MONTHS:
-        summary = "Взяты количества из месячных колонок; проверьте, что они означают продажи. " + summary
-    elif source == SalesQuantity.OUTFLOW:
-        summary = "«Расход» может включать не только продажи. " + summary
+        summary.append(f"Остатки доступны только на дату снимка ({snapshot_label}).")
     return ImportedProducts(
-        tuple(products), totals, repeats, no_values, summary,
-        ((3, quantity_note),
-         (4, "Колонки фактической суммы продаж нет. Текущая розничная цена не заменяет цены отдельных продаж."),
-         (5, stock_quantity_note), (6, stock_amount_note)),
+        tuple(products), totals, repeats, no_values, " ".join(summary),
+        ((3, quantity_note), (4, sales_amount_note), (5, stock_quantity_note), (6, stock_amount_note)),
         ReportPeriod(sales_label, tuple(month.label for month in months), stock_label),
     )

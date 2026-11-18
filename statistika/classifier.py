@@ -73,12 +73,10 @@ def _rule(rule: RecognitionRule, group: int) -> Rule | None:
 
 
 class Classifier:
-    def __init__(self, catalog: Catalog, *, include_electrical: bool = False) -> None:
+    def __init__(self, catalog: Catalog) -> None:
         by_word: dict[str, set[Rule]] = defaultdict(set)
         for group in GROUPS:
             for entry in catalog.recognition_rules(group):
-                if entry.internal_only and not include_electrical:
-                    continue
                 if rule := _rule(entry, group):
                     by_word[rule.first.words[0]].add(rule)
         self._by_word = dict(by_word)

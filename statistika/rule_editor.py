@@ -61,13 +61,8 @@ class RuleEditor(ttk.Frame):
         self.also = self._text_field(details, "Также в названии (если нужно)", 0)
         self.also_at_start = self._text_field(details, "Также в начале (если нужно)", 1)
 
-        self.internal_only = tk.BooleanVar(master=self)
-        self.internal_check = ttk.Checkbutton(self, text="Только для внутренней стройгруппы", variable=self.internal_only)
-        self.internal_check.grid(row=4, columnspan=2, sticky="w", pady=(4, 0))
-        self.internal_check.grid_remove()
-
         buttons = ttk.Frame(self)
-        buttons.grid(row=5, columnspan=2, sticky="ew", pady=(6, 0))
+        buttons.grid(row=4, columnspan=2, sticky="ew", pady=(6, 0))
         ttk.Button(buttons, text="Добавить", command=self.add).pack(side="left")
         self.change_button = ttk.Button(buttons, text="Изменить", command=self.change)
         self.change_button.pack(side="left", padx=6)
@@ -85,12 +80,8 @@ class RuleEditor(ttk.Frame):
         field.grid(row=1, column=column, sticky="ew", padx=(0, 6) if column == 0 else 0)
         return field
 
-    def load(self, rules: tuple[RecognitionRule, ...], *, construction: bool = False) -> None:
+    def load(self, rules: tuple[RecognitionRule, ...]) -> None:
         self.rules = list(rules)
-        if construction:
-            self.internal_check.grid()
-        else:
-            self.internal_check.grid_remove()
         self.query.set("")
         self._fill(RecognitionRule(""))
 
@@ -100,8 +91,7 @@ class RuleEditor(ttk.Frame):
         shown = 0
         for index, rule in enumerate(self.rules):
             extra = "; ".join((*rule.also, *(p + " (в начале)" for p in rule.also_at_start)))
-            action = _ACTIONS[rule.exclude] + (" (внутр.)" if rule.internal_only else "")
-            values = rule.phrase, _POSITIONS[rule.at_start], action, extra
+            values = rule.phrase, _POSITIONS[rule.at_start], _ACTIONS[rule.exclude], extra
             if query not in " ".join(values).casefold().replace("ё", "е"):
                 continue
             self.tree.insert("", "end", iid=str(index), values=values)
@@ -128,7 +118,6 @@ class RuleEditor(ttk.Frame):
         self.phrase.insert(0, rule.phrase)
         self.position.current(int(rule.at_start))
         self.action.current(int(rule.exclude))
-        self.internal_only.set(rule.internal_only)
         for field, phrases in ((self.also, rule.also), (self.also_at_start, rule.also_at_start)):
             field.delete("1.0", "end")
             field.insert("1.0", "\n".join(phrases))
@@ -142,8 +131,7 @@ class RuleEditor(ttk.Frame):
         if not all(any(ch.isalnum() for ch in value) for value in (phrase, *also, *starts)):
             messagebox.showwarning("Правило распознавания", "Укажите фразу с буквами или цифрами.", parent=self)
             return None
-        return RecognitionRule(phrase, self.position.current() == 1, self.action.current() == 1, also, starts,
-                               self.internal_only.get())
+        return RecognitionRule(phrase, self.position.current() == 1, self.action.current() == 1, also, starts)
 
     def _commit(self, selected: int | None = None) -> None:
         self.on_change(tuple(self.rules))

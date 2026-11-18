@@ -14,8 +14,8 @@ from statistika.catalog import GROUPS, PDF_GROUPS, Catalog, CatalogError, load_c
 from statistika.dialogs import CatalogDialog, ColumnMappingDialog, SheetDialog
 from statistika.inline_picker import InlineGroupPicker
 from statistika.report import (
-    ALL_WAREHOUSES, INTERNAL_NOTE, QUANTITY_NOTE, SUMMARY_NOTE, ReportRow, display_number, display_quantity, display_total,
-    display_unit_totals, export_xlsx, group_label, in_warehouse, refresh_groups, summarize_groups, unit_totals, warehouses,
+    ALL_WAREHOUSES, QUANTITY_NOTE, RESULT_COLUMNS, SUMMARY_COLUMNS, SUMMARY_NOTE, ReportRow,
+    display_number, display_quantity, display_total, export_xlsx, in_warehouse, refresh_groups, summarize_groups, warehouses,
 )
 from statistika.statement import ImportedProducts, ReportPeriod, Sheet, StatementError, guess_plan, import_products, list_sheets, read_sheet
 from statistika.warehouse import SalesQuantity, WarehouseLayout, detect_warehouse_layout, import_warehouse_products
@@ -24,7 +24,10 @@ _BG = "#f1f5fa"
 _INK = "#16304c"
 _MUTED = "#466078"
 _BLUE = "#174f91"
-_VIEWS = ("Все строки", "Только с группой", "Только без группы")
+_ALL_ROWS, _ASSIGNED_ROWS, _UNASSIGNED_ROWS = "all", "assigned", "unassigned"
+_GROUP_FILTER_PRESETS = {
+    _ALL_ROWS: "Все строки", _ASSIGNED_ROWS: "Только с группой", _UNASSIGNED_ROWS: "Только без группы",
+}
 _SALES_LABELS = {
     SalesQuantity.MONTHS: "По месяцам",
     SalesQuantity.UNKNOWN: "Не заполнять",
@@ -69,19 +72,17 @@ class MainWindow:
         self.sales_options: tuple[SalesQuantity, ...] = ()
         self.applied_source = SalesQuantity.UNKNOWN
         self.month_range: tuple[int, int] | None = None
-        self.include_electrical = tk.BooleanVar(value=False)
         self.warehouse_options: tuple[str | None, ...] = (None,)
-        self.view = tk.StringVar(value=_VIEWS[0])
+        self.group_filter = tk.StringVar(value=_ALL_ROWS)
         self.period_text = tk.StringVar()
         self.catalog_summary = tk.StringVar()
         self.source_text = tk.StringVar(value="Ведомость ещё не открыта")
         self.total_text = tk.StringVar(value="Строки: 0")
         self.assigned_text = tk.StringVar(value="С группой: 0")
         self.unassigned_text = tk.StringVar(value="Без группы: 0")
-        self.selection_text = tk.StringVar(value="Выбор группы: нажмите на первый столбец или клавишу Enter на выбранной строке.")
+        self.selection_text = tk.StringVar()
         self.export_text = tk.StringVar()
         self.method_text = tk.StringVar()
-        self.import_note = ""
 
         root.title("Статистика — продажи и остатки")
         root.geometry(f"{min(1240, root.winfo_screenwidth() - 55)}x{min(760, root.winfo_screenheight() - 100)}")
@@ -128,13 +129,6 @@ class MainWindow:
         self.warehouse_selector.set(ALL_WAREHOUSES)
         self.warehouse_selector.pack(side="left", padx=(6, 16))
         self.warehouse_selector.bind("<<ComboboxSelected>>", lambda _event: self.redraw())
-        self.view_selector = ttk.Combobox(filters, state="readonly", textvariable=self.view, values=_VIEWS, width=20)
-        self.view_selector.pack(side="left")
-        self.view_selector.bind("<<ComboboxSelected>>", lambda _event: self.redraw())
-        ttk.Checkbutton(
-            filters, text="Электромонтаж в №53 (внутренний отчёт)", variable=self.include_electrical,
-            command=self.change_group_scope,
-        ).pack(side="right", padx=(8, 0))
 
         self.period_fields = ttk.Frame(body)
         self.period_fields.grid(row=3, sticky="ew", pady=(0, 8))
@@ -172,11 +166,12 @@ class MainWindow:
         names = ("group", "name", "sold_qty", "sold_amount", "stock_qty", "stock_amount")
         self.tree = ttk.Treeview(table, columns=names, show="headings", selectmode="browse")
         self.tree.grid(row=0, column=0, sticky="nsew")
-        headers = ("№ пункта и описание", "Наименование товара", "Продано за период\nКоличество, шт.*",
-                   "Продано за период\nСумма, руб.", "Остаток на конец\nКоличество, шт.*", "Остаток на конец\nСумма, руб.")
-        for index, (name, title, width) in enumerate(zip(names, headers, (268, 268, 131, 131, 136, 136))):
+        headers = (*RESULT_COLUMNS[:2], "Продано, шт.*", "Продано, руб.", "Остаток, шт.*", "Остаток, руб.")
+        for index, (name, title, width) in enumerate(zip(names, headers, (228, 246, 111, 111, 111, 111))):
             self.tree.heading(name, text=title, anchor="w" if index < 2 else "center")
-            self.tree.column(name, width=width, minwidth=width, anchor="w" if index < 2 else "e", stretch=index < 2)
+            self.tree.column(name, width=width, minwidth=min(width, 172), anchor="w" if index < 2 else "e", stretch=index < 2)
+        self.group_menu = tk.Menu(self.tree, tearoff=False)
+        self.tree.heading("group", command=self.open_group_filter)
         sy = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         sx = ttk.Scrollbar(table, orient="horizontal", command=self.tree.xview)
         sy.grid(row=0, column=1, sticky="ns")
@@ -208,12 +203,12 @@ class MainWindow:
         tab = self.summary_tab
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=1)
-        columns = ("#0", "lines", "sold_qty", "sold_amount", "stock_qty", "stock_amount")
-        self.summary_tree = ttk.Treeview(tab, columns=columns[1:], show="tree headings", selectmode="browse")
+        columns = ("group", "lines", "sold_qty", "sold_amount", "stock_qty", "stock_amount")
+        self.summary_tree = ttk.Treeview(tab, columns=columns, show="headings", selectmode="browse")
         self.summary_tree.grid(row=0, column=0, sticky="nsew")
-        headers = ("Группа / единица", "Строк", "Продано, по ед.", "Продажи, руб.", "Остаток, по ед.", "Остаток, руб.")
-        for index, (column, label, width) in enumerate(zip(columns, headers, (294, 63, 142, 125, 142, 125))):
-            self.summary_tree.column(column, width=width, minwidth=width, anchor="w" if not index else "e", stretch=not index)
+        headers = ("Группа", "Строк", *SUMMARY_COLUMNS[2:])
+        for index, (column, label, width) in enumerate(zip(columns, headers, (276, 63, 120, 120, 120, 120))):
+            self.summary_tree.column(column, width=width, minwidth=min(width, 175), anchor="w" if not index else "e", stretch=not index)
             self.summary_tree.heading(column, text=label, anchor="w" if not index else "center")
         sy = ttk.Scrollbar(tab, orient="vertical", command=self.summary_tree.yview)
         sx = ttk.Scrollbar(tab, orient="horizontal", command=self.summary_tree.xview)
@@ -232,26 +227,12 @@ class MainWindow:
 
     def refresh_summary(self, rows: list[ReportRow]) -> None:
         tree = self.summary_tree
-        expanded = {item for item in tree.get_children() if tree.item(item, "open")}
         tree.delete(*tree.get_children())
-        for total in summarize_groups(rows) if self.rows else ():
-            item = str(total.group)
-            label = self.row_label(total.group, short=True) or "Без группы"
-            quantities = []
-            for is_sale in (True, False):
-                by_unit = unit_totals(total, sold=is_sale)
-                quantities.append(
-                    "Раскройте группу" if len(by_unit) > 1 and any(value.known for _, value in by_unit)
-                    else display_unit_totals(by_unit)
-                )
-            tree.insert("", "end", iid=item, text=label, open=item in expanded, values=(
-                total.lines, quantities[0], display_total(total.sold_amount), quantities[1], display_total(total.ending_amount),
+        for group in summarize_groups(rows) if self.rows else ():
+            tree.insert("", "end", iid=str(group.group), values=(
+                self.catalog.short_label(group.group) or "Без группы", group.lines,
+                *(display_total(total) for total in group.metrics),
             ))
-            if len(total.units) > 1:
-                for unit in total.units:
-                    tree.insert(item, "end", text=unit.unit or "Ед. не указана", values=(
-                        unit.sold.lines, display_total(unit.sold), "", display_total(unit.ending), "",
-                    ))
 
     def update_catalog_summary(self) -> None:
         ready = len(PDF_GROUPS) - len(self.catalog.missing)
@@ -319,18 +300,8 @@ class MainWindow:
         if mapping.result is not None:
             self.display_report(path, sheet_name, mapping.result)
 
-    def row_label(self, group: int | None, *, short: bool = False) -> str:
-        return group_label(self.catalog, group, include_electrical=self.include_electrical.get(), short=short)
-
     def classify(self) -> None:
-        refresh_groups(self.rows, self.catalog, include_electrical=self.include_electrical.get())
-
-    def change_group_scope(self) -> None:
-        self.classify()
-        self.update_method_note()
-        self.redraw(keep_position=True)
-        if self.rows:
-            self.export_text.set("Группы пересчитаны. Ручные назначения не изменились.")
+        refresh_groups(self.rows, self.catalog)
 
     def display_report(
         self, path: Path, sheet_name: str, result: ImportedProducts,
@@ -341,7 +312,7 @@ class MainWindow:
         self.rows = [ReportRow(product) for product in result.products]
         self.classify()
         self.unsaved.clear()
-        self.view.set(_VIEWS[0])
+        self.group_filter.set(_ALL_ROWS)
         self.setup_period()
         self.set_report_metadata(result)
         available = warehouses(self.rows)
@@ -425,13 +396,33 @@ class MainWindow:
             f"Остатки: {self.period.stock_label or 'дата не указана'}"
         )
         self.column_notes = result.column_notes
-        self.import_note = result.summary
-        self.update_method_note()
+        self.method_text.set("  ".join(part for part in (QUANTITY_NOTE, result.summary) if part))
 
-    def update_method_note(self) -> None:
-        self.method_text.set("  ".join(part for part in (
-            QUANTITY_NOTE, self.import_note, INTERNAL_NOTE if self.include_electrical.get() else "",
-        ) if part))
+    def open_group_filter(self) -> None:
+        self.picker.dismiss()
+        menu = self.group_menu
+        menu.delete(0, "end")
+        for value, label in _GROUP_FILTER_PRESETS.items():
+            menu.add_radiobutton(label=label, variable=self.group_filter, value=value, command=self.redraw)
+        menu.add_separator()
+        for number in GROUPS:
+            label = self.catalog.short_label(number)
+            menu.add_radiobutton(label=label if len(label) <= 72 else label[:71] + "…",
+                                 variable=self.group_filter, value=str(number), command=self.redraw)
+        try:
+            menu.tk_popup(*self.tree.winfo_pointerxy())
+        finally:
+            menu.grab_release()
+
+    @staticmethod
+    def matches_group_filter(group: int | None, selected: str) -> bool:
+        if selected == _ALL_ROWS:
+            return True
+        if selected == _ASSIGNED_ROWS:
+            return group is not None
+        if selected == _UNASSIGNED_ROWS:
+            return group is None
+        return group is not None and str(group) == selected
 
     def redraw(self, *, keep_position: bool = False) -> None:
         self.picker.dismiss()
@@ -440,13 +431,17 @@ class MainWindow:
         y = self.tree.yview()[0] if keep_position else 0
         self.tree.delete(*self.tree.get_children())
         visible = 0
-        view = self.view.get()
+        selected_group = self.group_filter.get()
+        heading = RESULT_COLUMNS[0] if selected_group == _ALL_ROWS else _GROUP_FILTER_PRESETS.get(
+            selected_group, f"Группа №{selected_group}",
+        )
+        self.tree.heading("group", text=f"{heading} ▾")
         warehouse = self.active_warehouse()
         for index, row in enumerate(self.rows):
-            if not in_warehouse(row, warehouse) or not self.visible_in_view(row, view):
+            if not in_warehouse(row, warehouse) or not self.matches_group_filter(row.group, selected_group):
                 continue
             self.tree.insert("", "end", iid=str(index), values=(
-                self.row_label(row.group, short=True), row.product.name,
+                self.catalog.short_label(row.group), row.product.name,
                 display_quantity(row.product.sold_quantity, row.product.unit), display_number(row.product.sold_amount),
                 display_quantity(row.product.ending_quantity, row.product.unit), display_number(row.product.ending_amount),
             ), tags=("odd",) if visible % 2 else ())
@@ -462,18 +457,12 @@ class MainWindow:
         self.refresh_summary(selected_rows)
         self.refresh_selection()
 
-    @staticmethod
-    def visible_in_view(row: ReportRow, view: str) -> bool:
-        return view == _VIEWS[0] or (view == _VIEWS[1] and row.group is not None) or (view == _VIEWS[2] and row.group is None)
-
     def refresh_counters(self, rows: list[ReportRow]) -> None:
         unassigned = sum(row.group is None for row in rows)
         self.total_text.set(f"Строки: {len(rows)}")
         self.assigned_text.set(f"С группой: {len(rows) - unassigned}")
         self.unassigned_text.set(f"Без группы: {unassigned}")
-        view = self.view.get()
-        available = (len(rows), len(rows) - unassigned, unassigned)[_VIEWS.index(view)]
-        if available:
+        if self.tree.get_children():
             self.empty.place_forget()
         else:
             self.empty.configure(text=("В этом фильтре нет строк." if self.rows else
@@ -487,19 +476,18 @@ class MainWindow:
 
     def refresh_selection(self, _event=None) -> None:
         showing_detail = self.tabs.select() == str(self.detail_tab)
-        self.view_selector.configure(state="readonly" if showing_detail else "disabled")
         if not showing_detail:
             self.picker.dismiss()
             self.edit_button.state(["disabled"])
-            self.selection_text.set("Сводка включает все строки выбранного склада, независимо от фильтра назначений.")
+            self.selection_text.set("Сводка включает все строки выбранного склада. Фильтр группы в шапке действует только на просмотр.")
             return
         index = self.selected_index()
         self.edit_button.state(["disabled"] if index is None else ["!disabled"])
         if index is None:
-            text = "Нажмите на первый столбец или клавишу Enter на выбранной строке, чтобы изменить группу."
+            text = "Группа ▾ в шапке — фильтр. Нажмите на ячейку первого столбца или Enter, чтобы изменить группу строки."
         else:
             row = self.rows[index]
-            group = self.row_label(row.group) or "группа не назначена"
+            group = self.catalog.label(row.group) or "группа не назначена"
             text = f"{row.product.name}  ·  {group}"
             if row.manual:
                 text += "  (вручную)"
@@ -528,7 +516,7 @@ class MainWindow:
             return
         row.assign(group)
         self.unsaved.add(index)
-        if not self.visible_in_view(row, self.view.get()):
+        if not self.matches_group_filter(row.group, self.group_filter.get()):
             next_item = self.tree.next(item) or self.tree.prev(item)
             self.tree.delete(item)
             if next_item:
@@ -536,7 +524,7 @@ class MainWindow:
                 self.tree.focus(next_item)
                 self.tree.see(next_item)
         else:
-            self.tree.set(item, "group", self.row_label(row.group, short=True))
+            self.tree.set(item, "group", self.catalog.short_label(row.group))
         selected_rows = self.warehouse_rows()
         self.refresh_counters(selected_rows)
         self.refresh_summary(selected_rows)
@@ -561,8 +549,7 @@ class MainWindow:
         self.root.configure(cursor="watch")
         self.root.update_idletasks()
         try:
-            export_xlsx(path, self.rows, self.catalog, self.column_notes, period=self.period, warehouse=warehouse,
-                        include_electrical=self.include_electrical.get())
+            export_xlsx(path, self.rows, self.catalog, self.column_notes, period=self.period, warehouse=warehouse)
         except (OSError, ValueError) as error:
             messagebox.showerror("Не удалось сохранить Excel", str(error), parent=self.root)
         else:
@@ -625,7 +612,8 @@ def _self_test(marker: Path) -> int:
                 catalog_editor.rule_group.current(GROUPS.index(53))
                 catalog_editor._switch_rule()
                 assert RecognitionRule("антисептик", at_start=True) in editor.rules
-                assert any(rule.exclude for rule in editor.rules) and any(rule.internal_only for rule in editor.rules)
+                assert any(rule.exclude for rule in editor.rules)
+                assert RecognitionRule("автомат ва 47", at_start=True) in editor.rules
                 editor.phrase.insert(0, "Пробная фраза CI")
                 editor.position.current(1)
                 editor.add()
@@ -652,6 +640,22 @@ def _self_test(marker: Path) -> int:
                 root.update()
                 assert [row.group for row in app.rows] == [100, None]
                 assert len(app.tree.get_children()) == 2
+                for column, unit in (("sold_qty", "шт."), ("sold_amount", "руб."), ("stock_qty", "шт."), ("stock_amount", "руб.")):
+                    assert unit in app.tree.heading(column, "text")
+
+                def choose_group_filter(value: str) -> None:
+                    with patch.object(app.group_menu, "tk_popup") as popup:
+                        root.tk.call(app.tree.heading("group", "command"))
+                        popup.assert_called_once()
+                    option = next(index for index in range(app.group_menu.index("end") + 1)
+                                  if app.group_menu.type(index) == "radiobutton" and app.group_menu.entrycget(index, "value") == value)
+                    app.group_menu.invoke(option)
+                    root.update()
+
+                choose_group_filter(_UNASSIGNED_ROWS)
+                assert app.tree.get_children() == ("1",)
+                choose_group_filter(_ALL_ROWS)
+                assert app.tree.get_children() == ("0", "1") and app.tree.heading("group", "text").endswith("▾")
                 x, y, width, height = app.tree.bbox("1", "#1")
                 app.tree.event_generate("<ButtonRelease-1>", x=x + width // 2, y=y + height // 2)
                 root.update()
@@ -701,53 +705,55 @@ def _self_test(marker: Path) -> int:
                     "Конечный остаток;Розничная цена;Октябрь 2026 г.;Ноябрь 2026 г.\n"
                     "Мир;АРХИВ;Американка 1/2 прямая Kalde;шт.;2;3;2;3;4,80;4;1\n"
                     "Кореличи;Абразивы;Американка 1/2 прямая Kalde;шт.;5;4;1;8;12;6;3\n"
-                    "Мир;Электрика;Автомат ВА 47-29 1п 16А IEK;шт.;;;4;;;;2\n",
+                    "Мир;Электрика;Автомат ВА 47-29 1п 16А IEK;шт.;1;2;4;5;2,50;0;2\n"
+                    "Мир;Клеи;Клей Бустилат 0,9кг;банка;1;5;3;4;3;2;3\n",
                     encoding="utf-8",
                 )
                 with patch.object(ColumnMappingDialog, "show", side_effect=AssertionError("Лишнее окно импорта")):
                     app.open_path(warehouse)
                 root.update()
-                assert [row.group for row in app.rows] == [53, 53, None]
+                assert [row.group for row in app.rows] == [53, 53, 53, 53]
                 assert app.applied_source == SalesQuantity.MONTHS and app.period.sales_months == ("Октябрь 2026", "Ноябрь 2026")
-                assert app.rows[0].product.metrics == (5, None, 3, Decimal("14.4"))
+                assert app.rows[0].product.metrics == (5, 24, 3, Decimal("14.4"))
                 assert app.period_fields.winfo_ismapped() and app.month_fields.winfo_ismapped()
                 app.warehouse_selector.current(app.warehouse_options.index("Мир"))
                 app.warehouse_selector.event_generate("<<ComboboxSelected>>")
                 root.update()
-                assert app.tree.get_children() == ("0", "2")
-                assert app.summary_tree.set("53", "lines") == "1"
+                assert app.tree.get_children() == ("0", "2", "3")
+                assert app.summary_tree.set("53", "lines") == "3"
+                assert app.summary_tree.set("53", "sold_qty") == "12"
+                choose_group_filter("53")
+                assert "№53" in app.tree.heading("group", "text")
+                assert app.tree.set("2", "group") == app.catalog.short_label(53)
                 app.assign_group("0", 100)
-                app.include_electrical.set(True)
-                app.change_group_scope()
-                assert [row.group for row in app.rows] == [100, 53, 53]
-                assert "Внутренняя" in app.tree.set("2", "group")
+                assert app.tree.get_children() == ("2", "3")
+                assert [row.group for row in app.rows] == [100, 53, 53, 53]
                 assert app.unsaved == {0}
 
                 # Изменение периода не читает файл заново и не теряет склад, фильтр и ручные назначения.
-                app.view.set(_VIEWS[1])
-                app.redraw()
                 with patch("statistika.app.read_sheet", side_effect=AssertionError("Повторное чтение файла")):
                     app.last_month.current(0)
                     app.last_month.event_generate("<<ComboboxSelected>>")
                     root.update()
                     assert app.period.sales_months == ("Октябрь 2026",)
-                    assert app.rows[0].product.metrics == (4, None, None, None)
-                    assert app.rows[2].product.metrics == (None,) * 4
+                    assert app.rows[0].product.metrics == (4, Decimal("19.2"), None, None)
+                    assert app.rows[2].product.metrics == (0, 0, None, None)
                     # Конец раньше нового начала: обе границы становятся ноябрём.
                     app.first_month.current(1)
                     app.first_month.event_generate("<<ComboboxSelected>>")
                     root.update()
                 assert app.last_month.current() == 1
                 assert app.period.sales_months == ("Ноябрь 2026",) and app.period.stock_label == "15.11.2026"
-                assert app.rows[0].product.metrics == (1, None, 3, Decimal("14.4"))
-                assert app.active_warehouse() == "Мир" and app.view.get() == _VIEWS[1]
+                assert app.rows[0].product.metrics == (1, Decimal("4.8"), 3, Decimal("14.4"))
+                assert app.active_warehouse() == "Мир" and app.group_filter.get() == "53"
                 assert app.rows[0].manual and app.rows[0].group == 100 and app.unsaved == {0}
-                assert app.tree.get_children() == ("0", "2") and app.tree.set("0", "sold_qty") == "1"
-                assert app.summary_tree.set("100", "sold_qty") == "1 шт."
+                assert app.tree.get_children() == ("2", "3") and app.tree.set("2", "sold_amount") == "5,00"
+                assert app.summary_tree.set("53", "sold_qty") == "5"  # 2 шт. + 3 банки
+                assert app.summary_tree.set("100", "sold_qty") == "1"
 
                 app.sales_selector.current(app.sales_options.index(SalesQuantity.OUTFLOW))
                 app.change_period()
-                assert app.rows[0].product.sold_quantity == 2 and not app.month_fields.winfo_manager()
+                assert app.rows[0].product.metrics[:2] == (2, Decimal("9.6")) and not app.month_fields.winfo_manager()
                 app.sales_selector.current(app.sales_options.index(SalesQuantity.MONTHS))
                 app.change_period()
                 assert app.period.sales_months == ("Ноябрь 2026",)
@@ -757,10 +763,12 @@ def _self_test(marker: Path) -> int:
                     app.save_report()
                 workbook = load_workbook(target)
                 try:
-                    assert workbook.active.max_row == 3 and workbook.active.max_column == 6
-                    assert workbook.active["C2"].value == 1 and workbook.active["E2"].value == 3
-                    assert "Внутренняя" in workbook.active["A3"].value
-                    assert "Не использовать как строку 51" in workbook["Сводка по группам"]["A4"].value
+                    detail, summary = workbook.worksheets
+                    assert detail.max_row == 4 and detail.max_column == 6
+                    assert tuple(cell.value for cell in detail[2][2:]) == (1, 4.8, 3, 14.4)
+                    assert detail["A3"].value == app.catalog.label(53)
+                    assert detail.auto_filter.ref == "A1:F4"
+                    assert tuple(cell.value for cell in summary[6 + GROUPS.index(53)][2:]) == (5, 14, 9, 24.5)
                 finally:
                     workbook.close()
                 assert not app.unsaved

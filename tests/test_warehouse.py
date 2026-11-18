@@ -6,7 +6,7 @@ from openpyxl import Workbook, load_workbook
 
 from statistika.catalog import builtin_catalog
 from statistika.report import RESULT_COLUMNS, ReportRow, export_xlsx, refresh_groups
-from statistika.statement import Sheet, SourcePeriod, StatementError, read_sheet
+from statistika.statement import Sheet, SourcePeriod, StatementError, guess_plan, import_products, read_sheet
 from statistika.warehouse import MonthColumn, SalesQuantity, WarehouseLayout, detect_warehouse_layout, import_warehouse_products
 
 _HEADERS = (
@@ -49,14 +49,16 @@ def test_warehouse_profile_through_xlsx_and_report(tmp_path):
     assert [row.metrics for row in safe.products] == [(None, None, Decimal("2.5"), 12), (None, None, 0, 0),
                                                        (None, None, 4, None), (None, None, 3, None)]
     assert safe.skipped_totals == safe.skipped_headers == 1
-    assert "неоднозначной ценой — 2" in safe.summary
+    assert "Суммы остатков" in safe.summary and "2 строк" in safe.summary
     assert safe.products[0].warehouse == "Тестовый склад"
     assert safe.products[0].unit == "шт."
     months = import_warehouse_products(sheet, layout, SalesQuantity.MONTHS)
     assert [p.sold_quantity for p in months.products] == [9, 4, 2, 1]
     outflow = import_warehouse_products(sheet, layout, SalesQuantity.OUTFLOW)
     assert [p.sold_quantity for p in outflow.products] == [7, 4, 2, 1]
-    assert all(p.sold_amount is None for p in months.products + outflow.products)
+    assert [p.sold_amount for p in months.products] == [Decimal("43.2"), None, None, None]
+    assert [p.sold_amount for p in outflow.products] == [Decimal("33.6"), None, None, None]
+    assert "розничная цена (N)" in months.summary
 
     rows = [ReportRow(p) for p in months.products]
     catalog = builtin_catalog()
@@ -73,16 +75,23 @@ def test_warehouse_profile_through_xlsx_and_report(tmp_path):
         assert tuple(c.value for c in sheet[1]) == RESULT_COLUMNS
         assert sheet["A2"].value == catalog.label(53)
         assert sheet["A3"].value is None
-        assert (sheet["C2"].value, sheet["D2"].value, sheet["E2"].value, sheet["F2"].value) == (9, None, 2.5, 12)
-        assert "Q:R" in sheet["C1"].comment.text and "не заменяет" in sheet["D1"].comment.text
+        assert (sheet["C2"].value, sheet["D2"].value, sheet["E2"].value, sheet["F2"].value) == (9, 43.2, 2.5, 12)
+        assert "Q:R" in sheet["C1"].comment.text and "розничная цена (N)" in sheet["D1"].comment.text
+        assert "не фактическая выручка" in sheet["D1"].comment.text
     finally:
         workbook.close()
+
+    # Новые подписи с единицами не мешают распознать экспортированный лист как табличную ведомость.
+    exported = read_sheet(target, "Продажи и остатки")
+    plan = guess_plan(exported)
+    assert plan.columns == (1, 2, 3, 4, 5)
+    assert import_products(exported, plan).products[0].metrics == months.products[0].metrics
 
 
 def test_blank_months_are_not_silently_converted_to_zero():
     data = Sheet((_HEADERS, stock_row("Товар", 8, 1, 2, (None, 4))))
     layout = detect_warehouse_layout(data)
-    assert import_warehouse_products(data, layout, SalesQuantity.MONTHS).products[0].sold_quantity is None
+    assert import_warehouse_products(data, layout, SalesQuantity.MONTHS).products[0].metrics[:2] == (None, None)
 
 
 def test_requires_unambiguous_columns_and_reports_bad_qty():
@@ -125,13 +134,13 @@ def test_selected_months_and_end_stock_date_cannot_be_confused():
     assert early.period.sales_months == ("Октябрь 2026",)
     assert early.period.sales_label == "Октябрь 2026 (с 12.10.2026)"
     assert "нет" in early.period.stock_label
-    assert [p.metrics for p in early.products] == [(4, None, None, None), (None, None, None, None)]
+    assert [p.metrics for p in early.products] == [(4, 12, None, None), (None, None, None, None)]
     assert early.products[0].unit == "пог. м"
     last = import_warehouse_products(data, layout, SalesQuantity.MONTHS, (1, 1))
     assert last.period.sales_months == ("Ноябрь 2026",)
     assert last.period.sales_label == "Ноябрь 2026 (по 15.11.2026)"
     assert last.period.stock_label == "15.11.2026"
-    assert [p.metrics for p in last.products] == [(6, None, 7, 21), (0, None, 2, 8)]
+    assert [p.metrics for p in last.products] == [(6, 18, 7, 21), (0, 0, 2, 8)]
     with pytest.raises(StatementError, match="первый месяц"):
         import_warehouse_products(data, layout, SalesQuantity.MONTHS, (1, 0))
     with pytest.raises(StatementError, match="Расход.*за весь период"):
@@ -157,3 +166,25 @@ def test_period_changes_keep_rows_with_only_later_or_outflow_quantities():
         assert tuple(p.sold_quantity for p in result.products) == expected
         assert result.skipped_no_values == 1
         assert all(p.metrics[1:] == (None, None, None) for p in result.products)
+
+
+@pytest.mark.parametrize(("quantity", "price", "expected"), [
+    (None, "3,10", None),
+    (0, None, Decimal(0)),
+    ("1,25", "2,39", Decimal("2.9875")),
+    (-2, "3,10", Decimal("-6.20")),
+    (2, "7.30\n9.76", None),
+    (2, "—", None),
+    (2, "-1", None),
+    (2, 0, Decimal(0)),
+])
+def test_period_sales_value_does_not_require_an_ending_stock_snapshot(quantity, price, expected):
+    data = Sheet((
+        ("С 01.10.26 по 15.11.26",), _HEADERS,
+        stock_row("Товар", 9, 5, price, (quantity, 4), unit="банка"),
+    ))
+    result = import_warehouse_products(data, detect_warehouse_layout(data), SalesQuantity.MONTHS, (0, 0))
+    product = result.products[0]
+    assert product.sold_amount == expected
+    assert product.metrics[2:] == (None, None)
+    assert product.unit == "банка"

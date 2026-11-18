@@ -176,7 +176,7 @@ class CatalogDialog(Modal):
 
     def _load_rule(self) -> None:
         catalog = self._draft()
-        self.rule_editor.load(catalog.recognition_rules(self.editing_group), construction=self.editing_group == 53)
+        self.rule_editor.load(catalog.recognition_rules(self.editing_group))
         self.rule_description.set(_short(catalog.label(self.editing_group), 320))
 
     def _switch_rule(self, _event=None) -> None:

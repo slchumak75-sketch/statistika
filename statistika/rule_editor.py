@@ -1,4 +1,4 @@
-"""Поиск, включение и удаление фраз справочника."""
+"""Поиск, включение, исключение и удаление фраз справочника."""
 
 from __future__ import annotations
 
@@ -18,8 +18,17 @@ def _terms(rule: RecognitionRule) -> tuple[str, ...]:
     return rule.phrase, *rule.also, *rule.also_at_start
 
 
-def _check(rule: RecognitionRule) -> str:
-    return "☐" if rule.disabled else "☑"
+_ROW_ACTIONS = {"#1": "enabled", "#3": "exclude", "#4": "delete"}
+
+
+def _row_values(rule: RecognitionRule) -> tuple[str, ...]:
+    label = " · ".join(_terms(rule)) + (" (исключение)" if rule.exclude else "")
+    return ("☐" if rule.disabled else "☑", label, "Снять исключение" if rule.exclude else "Исключение", "Удалить")
+
+
+def _groups_for_add(catalog: Catalog) -> tuple[str, ...]:
+    labels = (catalog.short_label(number) for number in GROUPS)
+    return "Выберите группу", *(label if len(label) <= 46 else label[:45] + "…" for label in labels)
 
 
 class RuleEditor(ttk.Frame):
@@ -27,6 +36,7 @@ class RuleEditor(ttk.Frame):
         super().__init__(parent)
         self.catalog = catalog
         self.rules = dict(catalog.rules)
+        self.visible_group: int | None = None
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
 
@@ -43,19 +53,17 @@ class RuleEditor(ttk.Frame):
         self.phrase = ttk.Entry(form)
         self.phrase.grid(row=1, column=0, sticky="ew", padx=(0, 8))
         self.phrase.bind("<Return>", self._enter_phrase)
-        labels = tuple(catalog.short_label(number) for number in GROUPS)
-        self.group = ttk.Combobox(form, state="readonly", width=29, values=(
-            "Выберите группу", *(label if len(label) <= 46 else label[:45] + "…" for label in labels),
-        ))
+        self.group = ttk.Combobox(form, state="readonly", width=29, values=_groups_for_add(catalog))
         self.group.current(0)
         self.group.grid(row=1, column=1, sticky="ew", padx=(0, 8))
         self.include_button = ttk.Button(form, text="Включить", command=self.include_phrase)
         self.include_button.grid(row=1, column=2, sticky="e")
 
-        self.tree = ttk.Treeview(self, columns=("enabled", "phrase", "delete"), show="", selectmode="browse", height=14)
+        self.tree = ttk.Treeview(self, columns=("enabled", "phrase", "exclude", "delete"), show="", selectmode="browse", height=14)
         self.tree.column("enabled", width=36, minwidth=36, anchor="center", stretch=False)
-        self.tree.column("phrase", width=450, minwidth=220, anchor="w")
-        self.tree.column("delete", width=90, minwidth=90, anchor="center", stretch=False)
+        self.tree.column("phrase", width=400, minwidth=190, anchor="w")
+        self.tree.column("exclude", width=155, minwidth=155, anchor="center", stretch=False)
+        self.tree.column("delete", width=85, minwidth=85, anchor="center", stretch=False)
         self.tree.tag_configure("group", background="#e0eaf5", font=("Segoe UI", 9, "bold"))
         self.tree.tag_configure("disabled", foreground="#617488")
         self.tree.grid(row=2, column=0, sticky="nsew")
@@ -63,13 +71,36 @@ class RuleEditor(ttk.Frame):
         scroll.grid(row=2, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.bind("<ButtonRelease-1>", self._click)
-        self.tree.bind("<space>", self._toggle_selected)
-        self.tree.bind("<Delete>", self._delete_selected)
+        self.tree.bind("<Motion>", self._hover)
+        self.tree.bind("<Leave>", lambda _event: self.tree.configure(cursor=""))
+        for key, action in (("<space>", "enabled"), ("<Return>", "exclude"), ("<Delete>", "delete")):
+            self.tree.bind(key, lambda _event, action=action: self._edit_selected(action))
         self.query.trace_add("write", lambda *_: self._refresh())
         self._refresh()
 
+    def update_catalog(self, catalog: Catalog) -> None:
+        # Текст пунктов влияет на подписи и исходные фразы, но не заменяет правки пользователя.
+        if self.catalog.points == catalog.points:
+            return
+        self.catalog = catalog
+        index = max(0, self.group.current())
+        self.group.configure(values=_groups_for_add(catalog))
+        self.group.current(index)
+        self._refresh(keep_position=True)
+
+    def show_group(self, group: int | None) -> None:
+        self.visible_group = group
+        if group is not None:
+            self.group.current(1 + GROUPS.index(group))
+        self.group.configure(state="readonly" if group is None else "disabled")
+        self._refresh()
+
+    def restore_group(self, group: int) -> None:
+        self.rules.pop(group, None)
+        self._refresh()
+
     def _rules_for(self, number: int) -> tuple[RecognitionRule, ...]:
-        return self.rules[number] if number in self.rules else self.catalog.recognition_rules(number)
+        return self.rules[number] if number in self.rules else self.catalog.default_rules(number)
 
     def _refresh(self, *, keep_position: bool = False, selected: str = "") -> None:
         tree = self.tree
@@ -77,21 +108,21 @@ class RuleEditor(ttk.Frame):
         query = _search_key(self.query.get())
         tree.delete(*tree.get_children())
         count = 0
-        for number in GROUPS:
+        numbers = GROUPS if self.visible_group is None else (self.visible_group,)
+        for number in numbers:
             title_added = False
             for index, rule in enumerate(self._rules_for(number)):
                 terms = _terms(rule)
                 if query and query not in _search_key(" ".join(terms)):
                     continue
                 if not title_added:
-                    tree.insert("", "end", values=("", self.catalog.short_label(number), ""), tags=("group",))
+                    tree.insert("", "end", values=("", self.catalog.short_label(number), "", ""), tags=("group",))
                     title_added = True
-                label = " · ".join(terms) + (" (исключение)" if rule.exclude else "")
-                tree.insert("", "end", iid=f"{number}:{index}", values=(_check(rule), label, "Удалить"),
+                tree.insert("", "end", iid=f"{number}:{index}", values=_row_values(rule),
                             tags=("disabled",) if rule.disabled else ())
                 count += 1
         if not count:
-            tree.insert("", "end", values=("", "Фразы не найдены", ""))
+            tree.insert("", "end", values=("", "Фразы не найдены", "", ""))
         if selected and tree.exists(selected):
             tree.selection_set(selected)
             tree.focus(selected)
@@ -128,31 +159,32 @@ class RuleEditor(ttk.Frame):
         self._refresh(selected=f"{number}:{index}")
         return True
 
-    def _edit_row(self, item: str, *, delete: bool) -> None:
+    def _edit_row(self, item: str, action: str) -> None:
         if ":" not in item:
             return  # Не строка фразы: название группы или пустой результат поиска.
         number, index = map(int, item.split(":"))
         rules = list(self._rules_for(number))
-        if delete:
+        if action == "delete":
             del rules[index]
         else:
-            rule = rules[index] = replace(rules[index], disabled=not rules[index].disabled)
-            self.tree.set(item, "enabled", _check(rule))
-            self.tree.item(item, tags=("disabled",) if rule.disabled else ())
+            rule = rules[index]
+            rule = replace(rule, exclude=not rule.exclude) if action == "exclude" else replace(rule, disabled=not rule.disabled)
+            rules[index] = rule
+            self.tree.item(item, values=_row_values(rule), tags=("disabled",) if rule.disabled else ())
         self.rules[number] = tuple(rules)
-        if delete:
+        if action == "delete":
             self._refresh(keep_position=True)
 
     def _click(self, event) -> None:
-        item = self.tree.identify_row(event.y)
-        column = self.tree.identify_column(event.x)
-        if column in ("#1", "#3"):
-            self._edit_row(item, delete=column == "#3")
+        if action := _ROW_ACTIONS.get(self.tree.identify_column(event.x)):
+            self._edit_row(self.tree.identify_row(event.y), action)
 
-    def _toggle_selected(self, _event) -> str:
-        self._edit_row(next(iter(self.tree.selection()), ""), delete=False)
-        return "break"
+    def _hover(self, event) -> None:
+        interactive = self.tree.identify_column(event.x) in _ROW_ACTIONS and ":" in self.tree.identify_row(event.y)
+        cursor = "hand2" if interactive else ""
+        if self.tree.cget("cursor") != cursor:
+            self.tree.configure(cursor=cursor)
 
-    def _delete_selected(self, _event) -> str:
-        self._edit_row(next(iter(self.tree.selection()), ""), delete=True)
+    def _edit_selected(self, action: str) -> str:
+        self._edit_row(next(iter(self.tree.selection()), ""), action)
         return "break"

@@ -576,6 +576,7 @@ def _self_test(marker: Path) -> int:
     from openpyxl import Workbook, load_workbook
 
     from statistika.catalog import RecognitionRule
+    from statistika.classifier import Classifier
 
     def unexpected_dialog(title, message, **_kwargs):
         raise AssertionError(f"{title}: {message}")
@@ -605,10 +606,25 @@ def _self_test(marker: Path) -> int:
                 catalog_editor = CatalogDialog(root, app.catalog, catalog_path)
                 catalog_editor.deiconify()
                 root.update()
+                assert tuple(catalog_editor.tabs.tab(tab_id, "text") for tab_id in catalog_editor.tabs.tabs()) == (
+                    "Пункты PDF", "Правила распознавания",
+                )
+                catalog_editor.tabs.select(catalog_editor.points_tab)
+                root.update()
+                catalog_editor.points_text.insert("end", "\n75. Дополнительный пункт CI.")
+                catalog_editor.tabs.select(catalog_editor.rules_tab)
+                root.update()
                 editor = catalog_editor.rule_editor
-                assert editor.tree["columns"] == ("enabled", "phrase", "delete")
+                assert editor.tree["columns"] == ("enabled", "phrase", "exclude", "delete")
                 editor.query.set("ГЕЛЬ")
                 assert {"57", "63"} <= {item.split(":")[0] for item in editor.tree.get_children()}
+                catalog_editor.rule_group.current(1 + GROUPS.index(57))
+                catalog_editor.rule_group.event_generate("<<ComboboxSelected>>")
+                root.update()
+                assert {item.split(":")[0] for item in editor.tree.get_children() if ":" in item} == {"57"}
+                catalog_editor.rule_group.current(0)
+                catalog_editor.rule_group.event_generate("<<ComboboxSelected>>")
+                root.update()
 
                 def click_phrase(item: str, column: str) -> None:
                     editor.tree.see(item)
@@ -628,19 +644,31 @@ def _self_test(marker: Path) -> int:
                 editor.group.current(1 + GROUPS.index(53))
                 editor.phrase.insert(0, "Пробная фраза CI")
                 editor.include_button.invoke()
-                assert editor.rules[53][-1] == RecognitionRule("Пробная фраза CI")
+                enabled_phrase = RecognitionRule("Пробная фраза CI")
+                exclusion = RecognitionRule("Пробная фраза CI", exclude=True)
+                added = f"53:{len(editor.rules[53]) - 1}"
+                assert editor.rules[53][-1] == enabled_phrase and editor.tree.set(added, "exclude") == "Исключение"
+                click_phrase(added, "exclude")
+                assert editor.rules[53][-1] == exclusion and editor.tree.set(added, "exclude") == "Снять исключение"
+                assert editor.tree.set(added, "enabled") == "☑"
+                click_phrase(added, "exclude")
+                assert editor.rules[53][-1] == enabled_phrase
+                click_phrase(added, "exclude")
                 editor.phrase.insert(0, "Временная фраза CI")
                 editor.include_button.invoke()
                 temporary = f"53:{len(editor.rules[53]) - 1}"
                 assert editor.tree.set(temporary, "delete") == "Удалить"
                 click_phrase(temporary, "delete")
-                assert not editor.tree.exists(temporary) and editor.rules[53][-1] == RecognitionRule("Пробная фраза CI")
+                assert not editor.tree.exists(temporary) and editor.rules[53][-1] == exclusion
                 catalog_editor.save_button.invoke()
                 saved = load_catalog(catalog_path)
                 assert saved == catalog_editor.result
-                assert saved.points == app.catalog.points and saved.source == app.catalog.source
+                assert saved.points == {**app.catalog.points, 75: "Дополнительный пункт CI."} and saved.source == app.catalog.source
                 assert saved.rules[53][index] == RecognitionRule("шпатель", at_start=True, also=("фасадный",), disabled=True)
-                assert saved.rules[53][-1] == RecognitionRule("Пробная фраза CI")
+                assert saved.rules[53][-1] == exclusion
+                classifier = Classifier(saved)
+                assert classifier.group_for("Муфта PPR 40 мм") == 53
+                assert classifier.group_for("Муфта PPR 40 мм — пробная фраза CI") is None
 
                 assert len(app.catalog.points) == 74 and not app.catalog.missing
                 with patch.object(ColumnMappingDialog, "show", side_effect=AssertionError("Лишнее окно сопоставления")):

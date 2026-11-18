@@ -236,3 +236,29 @@ def test_saved_phrase_checkbox_must_be_boolean(tmp_path):
     }), encoding="utf-8")
     with pytest.raises(CatalogError, match="некорректные поля правила"):
         load_catalog(path)
+
+
+def test_switching_phrase_to_exclusion_only_blocks_its_own_group(tmp_path):
+    from dataclasses import replace
+
+    from statistika.classifier import Classifier
+
+    phrase = RecognitionRule("для макета", also=("пластик",))
+    catalog = Catalog({53: "Стройматериалы", 57: "Бытовая химия"}, {
+        53: (RecognitionRule("шпатель"), phrase),
+        57: (RecognitionRule("средство для чистки"),),
+    })
+    path = tmp_path / "catalog.json"
+    test_item = "Шпатель для макета, пластик"
+    assert Classifier(catalog).group_for(test_item) == 53
+    with_exclusion = replace(catalog, rules={**catalog.rules, 53: (catalog.rules[53][0], replace(phrase, exclude=True))})
+    save_catalog(with_exclusion, path)
+    saved = load_catalog(path)
+    assert saved == with_exclusion
+    classifier = Classifier(saved)
+    assert classifier.group_for(test_item) is None
+    assert classifier.group_for("Шпатель для макета, металл") == 53  # Условие фразы не потеряно.
+    assert classifier.group_for(test_item + " средство для чистки") == 57
+
+    restored = replace(saved, rules={**saved.rules, 53: (saved.rules[53][0], replace(saved.rules[53][1], exclude=False))})
+    assert restored == catalog and Classifier(restored).group_for(test_item) == 53

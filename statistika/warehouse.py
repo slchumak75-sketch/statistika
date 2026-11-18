@@ -12,7 +12,7 @@ from openpyxl.utils.cell import get_column_letter
 
 from statistika.statement import (
     ImportedProducts, Product, ReportPeriod, Sheet, SourcePeriod, StatementError, cell_at, find_source_period,
-    normalize_unit, parse_number,
+    is_missing_number, normalize_unit, parse_number,
 )
 
 
@@ -171,6 +171,9 @@ def import_warehouse_products(
     outflow = get_column_letter(layout.outflow_column + 1)
     stock = get_column_letter(layout.ending_column + 1)
     price = get_column_letter(layout.price_column + 1)
+    # Состав отчёта не зависит от периода: строки с данными только за другие месяцы
+    # сохраняют место и ручную группу даже при пустых показателях текущего периода.
+    metric_columns = (layout.ending_column, layout.outflow_column, *(month.column for month in layout.months))
     for row_number, row in enumerate(sheet.rows[layout.header_row :], start=layout.header_row + 1):
         name = _text(cell_at(row, layout.name_column))
         if _TOTAL.match(name) or (not name and any(_TOTAL.match(_text(value)) for value in row)):
@@ -178,6 +181,14 @@ def import_warehouse_products(
             continue
         if _header(name) == "номенклатура" and _header(cell_at(row, layout.ending_column)) == "конечный остаток":
             repeats += 1
+            continue
+        has_values = any(not is_missing_number(cell_at(row, column)) for column in metric_columns)
+        if not name:
+            if has_values:
+                raise StatementError(f"Строка {row_number}: есть показатели, но нет наименования товара.")
+            continue
+        if not has_values:
+            no_values += 1
             continue
         ending_qty = _number(row, layout.ending_column, row_number) if use_stock else None
         sold_qty: Decimal | None = None
@@ -188,13 +199,6 @@ def import_warehouse_products(
             # Не подменять пустой месячный показатель нулём, в т. ч. при частичных данных.
             if all(amount is not None for amount in amounts):
                 sold_qty = sum((amount for amount in amounts if amount is not None), Decimal(0))
-        if not name:
-            if ending_qty is not None or sold_qty is not None:
-                raise StatementError(f"Строка {row_number}: есть показатели, но нет наименования товара.")
-            continue
-        if ending_qty is None and sold_qty is None and (use_stock or not _text(cell_at(row, layout.ending_column))):
-            no_values += 1
-            continue
         stock_amount = None
         if ending_qty == 0:
             stock_amount = Decimal(0)
@@ -218,7 +222,7 @@ def import_warehouse_products(
     elif source == SalesQuantity.MONTHS:
         quantity_note = (
             f"Сумма количеств из {_column_span(months)} за выбранные месяцы: {', '.join(month.label for month in months)}. "
-            "Используется по выбору пользователя; строки с пустыми месяцами не рассчитаны."
+            "Заголовки не уточняют, что это продажи. Если хотя бы один выбранный месяц пуст, сумма количеств не рассчитана."
         )
         sales_label = _month_span(months, source_period)
     else:
@@ -234,6 +238,10 @@ def import_warehouse_products(
         stock_label = "нет на конец выбранного периода"
         stock_quantity_note = stock_amount_note = f"Не рассчитано: ведомость содержит только снимок остатков ({snapshot_label})."
         summary = f"Суммы продаж в источнике нет. Остатки не подставлены: ведомость содержит только снимок ({snapshot_label})."
+    if source == SalesQuantity.MONTHS:
+        summary = "Взяты количества из месячных колонок; проверьте, что они означают продажи. " + summary
+    elif source == SalesQuantity.OUTFLOW:
+        summary = "«Расход» может включать не только продажи. " + summary
     return ImportedProducts(
         tuple(products), totals, repeats, no_values, summary,
         ((3, quantity_note),

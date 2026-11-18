@@ -30,6 +30,17 @@ SUMMARY_COLUMNS = (
 QUANTITY_NOTE = "* Штучные товары — в шт.; для остальных указана единица ведомости, если она известна."
 SUMMARY_NOTE = "* Частичный итог. Количества с разными или неизвестными единицами не складываются."
 ALL_WAREHOUSES = "Все склады"
+INTERNAL_GROUP = "№53 — Внутренняя стройгруппа"
+INTERNAL_NOTE = (
+    "Внутренний отчёт: №53 может включать электромонтажные товары (47.59.12.200). "
+    "Не использовать как строку 51 формы 4-торг."
+)
+
+
+def group_label(catalog: Catalog, group: int | None, *, include_electrical: bool = False, short: bool = False) -> str:
+    if group == 53 and include_electrical:
+        return INTERNAL_GROUP
+    return catalog.short_label(group) if short else catalog.label(group)
 
 
 @dataclass
@@ -45,8 +56,8 @@ class ReportRow:
         self.manual = True
 
 
-def refresh_groups(rows: Iterable[ReportRow], catalog: Catalog) -> None:
-    classifier = Classifier(catalog)
+def refresh_groups(rows: Iterable[ReportRow], catalog: Catalog, *, include_electrical: bool = False) -> None:
+    classifier = Classifier(catalog, include_electrical=include_electrical)
     # Название одинакового товара не получает разные группы из-за склада или исходного раздела.
     by_name: dict[str, int | None] = {}
     for row in rows:
@@ -179,6 +190,7 @@ def _number_format(value: Decimal, unit: str = "", partial: bool = False) -> str
 
 def _write_summary(
     workbook: Workbook, rows: list[ReportRow], catalog: Catalog, period: ReportPeriod, warehouse: str,
+    include_electrical: bool,
 ) -> None:
     sheet = workbook.create_sheet("Сводка по группам")
     context = (
@@ -197,17 +209,19 @@ def _write_summary(
     if period.sales_months:
         _comment(sheet, 2, 2, "Месяцы реализации: " + ", ".join(period.sales_months) + ".")
     sheet.merge_cells("A4:F4")
-    sheet["A4"] = SUMMARY_NOTE
+    sheet["A4"] = SUMMARY_NOTE + ("\n" + INTERNAL_NOTE if include_electrical else "")
     sheet["A4"].alignment = Alignment(wrap_text=True)
-    sheet.row_dimensions[4].height = 28
+    sheet.row_dimensions[4].height = 42 if include_electrical else 28
     sheet.append(SUMMARY_COLUMNS)
     _header_style(sheet, 5, (44, 16, 26, 22, 26, 24))
     for index, totals in enumerate(summarize_groups(rows), start=6):
-        label = catalog.short_label(totals.group) or "Без группы"
+        label = group_label(catalog, totals.group, include_electrical=include_electrical, short=True) or "Без группы"
         sheet.append((label, totals.lines, None, totals.sold_amount.value, None, totals.ending_amount.value))
         sheet.cell(index, 1).data_type = "s"
         sheet.cell(index, 1).alignment = Alignment(wrap_text=True, vertical="top")
-        if totals.group is not None and label != catalog.label(totals.group):
+        if totals.group == 53 and include_electrical:
+            _comment(sheet, index, 1, INTERNAL_NOTE)
+        elif totals.group is not None and label != catalog.label(totals.group):
             _comment(sheet, index, 1, catalog.label(totals.group))
         height = 1
         for col, is_sale in ((3, True), (5, False)):
@@ -234,7 +248,7 @@ def _write_summary(
 
 def export_xlsx(
     path: Path, rows: Iterable[ReportRow], catalog: Catalog, column_notes: Iterable[tuple[int, str]] = (), *,
-    period: ReportPeriod = ReportPeriod(), warehouse: str | None = None,
+    period: ReportPeriod = ReportPeriod(), warehouse: str | None = None, include_electrical: bool = False,
 ) -> None:
     rows = [row for row in rows if in_warehouse(row, warehouse)]
     warehouse_label = warehouse if warehouse is not None else ALL_WAREHOUSES
@@ -243,6 +257,8 @@ def export_xlsx(
     sheet.title = "Продажи и остатки"
     sheet.append(RESULT_COLUMNS)
     _header_style(sheet, 1, (64, 52, 24, 22, 25, 24))
+    if include_electrical:
+        _comment(sheet, 1, 1, INTERNAL_NOTE)
     _comment(sheet, 1, 2, f"Склад: {warehouse_label}. Период реализации: {period.sales_label or 'не указан'}.")
     notes = dict(column_notes)
     for col in (3, 4, 5, 6):
@@ -254,7 +270,7 @@ def export_xlsx(
         if note := "\n".join(part for part in parts if part):
             _comment(sheet, 1, col, note)
     for index, row in enumerate(rows, start=2):
-        sheet.append((catalog.label(row.group) or None, row.product.name, *row.product.metrics))
+        sheet.append((group_label(catalog, row.group, include_electrical=include_electrical) or None, row.product.name, *row.product.metrics))
         for col in (1, 2):
             cell = sheet.cell(index, col)
             # Строки источника и справочника не интерпретируются как формулы.
@@ -267,7 +283,7 @@ def export_xlsx(
                     sheet.cell(index, col).number_format = _number_format(value, row.product.unit)
     sheet.freeze_panes = "C2"
     sheet.auto_filter.ref = sheet.dimensions
-    _write_summary(workbook, rows, catalog, period, warehouse_label)
+    _write_summary(workbook, rows, catalog, period, warehouse_label, include_electrical)
     with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".xlsx", delete=False) as stream:
         temporary = Path(stream.name)
     try:

@@ -3,13 +3,13 @@ from decimal import Decimal
 import pytest
 from openpyxl import load_workbook
 
-from statistika.catalog import Catalog
+from statistika.catalog import Catalog, RecognitionRule
 from statistika.report import RESULT_COLUMNS, ReportRow, display_number, export_xlsx, refresh_groups
 from statistika.statement import Product
 
 
 def test_override_and_export_preserve_order_full_labels_and_blanks(tmp_path):
-    catalog = Catalog({35: "Учебное описание 35", 36: "Учебное описание 36"}, {35: ("салфетка",)})
+    catalog = Catalog({35: "Учебное описание 35", 36: "Учебное описание 36"}, {35: (RecognitionRule("салфетка"),)})
     rows = [
         ReportRow(Product("Носки", Decimal("2"), Decimal("4.40"), Decimal("11"), Decimal("24.20"))),
         ReportRow(Product("Салфетка", Decimal("0"), None, Decimal("0"), None)),
@@ -107,3 +107,33 @@ def test_unknown_units_do_not_produce_a_quantity_total():
     total = summarize_groups(rows)[GROUPS.index(53)]
     assert total.units[0].sold.value is None and total.units[0].ending.value is None
     assert total.sold_amount.value == 18 and total.ending_amount.value == 20
+
+
+def test_electrical_addon_report_is_not_labelled_as_official_line_51(tmp_path):
+    from statistika.catalog import GROUPS, builtin_catalog
+    from statistika.report import INTERNAL_GROUP, INTERNAL_NOTE
+
+    catalog = builtin_catalog()
+    rows = [ReportRow(Product(name, None, None, None, None)) for name in (
+        "Автомат ВА 47-29 1п 16А IEK", "Американка 1/2 Kalde", "Розетка 7-202-01 с/з",
+    )]
+    refresh_groups(rows, catalog)
+    assert [row.group for row in rows] == [None, 53, None]
+    rows[2].assign(None)
+    refresh_groups(rows, catalog, include_electrical=True)
+    assert [row.group for row in rows] == [53, 53, None]
+    target = tmp_path / "Внутренняя стройгруппа.xlsx"
+    export_xlsx(target, rows, catalog, include_electrical=True)
+    workbook = load_workbook(target)
+    try:
+        assert workbook.active.max_column == 6
+        assert workbook.active["A2"].value == INTERNAL_GROUP
+        assert workbook.active["A1"].comment.text == INTERNAL_NOTE
+        summary = workbook["Сводка по группам"]
+        assert "Не использовать как строку 51" in summary["A4"].value
+        assert summary.cell(6 + GROUPS.index(53), 2).value == 2
+    finally:
+        workbook.close()
+    refresh_groups(rows, catalog)
+    assert [row.group for row in rows] == [None, 53, None]
+    assert rows[2].manual

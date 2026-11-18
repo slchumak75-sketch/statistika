@@ -320,6 +320,14 @@ _EMPTY_NUMBER = {"", "-", "—", "–"}
 _TOTAL = re.compile(r"^(?:(?:общий\s+)?итог(?:о|и)?|всего)\b", re.I)
 
 
+def _number_text(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).strip().replace("−", "-")
+
+
+def is_missing_number(value: object) -> bool:
+    return value is None or (isinstance(value, str) and _number_text(value) in _EMPTY_NUMBER)
+
+
 def parse_number(value: object) -> Decimal | None:
     """Оригинальные значения, без округления/подмены пропусков нулями."""
     if value is None:
@@ -329,7 +337,7 @@ def parse_number(value: object) -> Decimal | None:
     if isinstance(value, (Decimal, int, float)):
         result = Decimal(str(value))
     elif isinstance(value, str):
-        text = unicodedata.normalize("NFKC", value).strip().replace("−", "-")
+        text = _number_text(value)
         if text in _EMPTY_NUMBER:
             return None
         if text.startswith("(") and text.endswith(")"):

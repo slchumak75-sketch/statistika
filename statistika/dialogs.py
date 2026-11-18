@@ -10,13 +10,10 @@ from tkinter.scrolledtext import ScrolledText
 from openpyxl.utils.cell import get_column_letter
 
 from statistika.catalog import (
-    GROUPS, PDF_GROUPS, Catalog, CatalogError, builtin_catalog, extract_pdf_text, format_points, parse_points, save_catalog,
+    GROUPS, PDF_GROUPS, Catalog, CatalogError, RecognitionRule, builtin_catalog, extract_pdf_text, format_points, parse_points, save_catalog,
 )
-from statistika.statement import (
-    SOURCE_COLUMNS, ImportedProducts, ImportPlan, Sheet, StatementError, cell_at, column_headers,
-    guess_plan, import_products, read_sheet,
-)
-from statistika.warehouse import SalesQuantity, detect_warehouse_layout, import_warehouse_products
+from statistika.rule_editor import RuleEditor
+from statistika.statement import SOURCE_COLUMNS, ImportedProducts, ImportPlan, Sheet, StatementError, column_headers, import_products
 
 
 class Modal(tk.Toplevel):
@@ -73,7 +70,7 @@ class CatalogDialog(Modal):
         self.rules = dict(catalog.rules)
         self.editing_group = GROUPS[0]
         self.result: Catalog | None = None
-        self.minsize(620, 460)
+        self.minsize(770, 540)
         body = self.body()
         body.rowconfigure(1, weight=1)
         ttk.Label(body, text="Справочник товарных групп", style="DialogTitle.TLabel").grid(row=0, sticky="w", pady=(0, 12))
@@ -114,14 +111,13 @@ class CatalogDialog(Modal):
         self.rule_description = tk.StringVar()
         ttk.Label(rules, textvariable=self.rule_description, wraplength=675, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
         ttk.Label(
-            rules, wraplength=675, text="По одной фразе на строку. ^ — только в начале названия; ! — исключение; "
-            "« + » — обе фразы должны встретиться; # — комментарий. Пустой список отключает автоназначение для группы.",
+            rules, wraplength=705, text="Выберите строку, чтобы изменить или удалить правило. "
+            "Для дополнительных условий введите по одной фразе на строку.",
         ).pack(anchor="w", pady=8)
-        self.rules_text = ScrolledText(rules, height=10, width=79, wrap="word", undo=True, font="TkDefaultFont")
-        self.rules_text.pack(fill="both", expand=True)
-        self.shown_rule: tuple[str, ...] = ()
+        self.rule_editor = RuleEditor(rules, self._update_rules)
+        self.rule_editor.pack(fill="both", expand=True)
         self._load_rule()
-        tabs.bind("<<NotebookTabChanged>>", self._tab_changed)
+        tabs.bind("<<NotebookTabChanged>>", lambda _event: self._load_rule() if tabs.select() == str(rules) else None)
         self.footer(body, 2, "Сохранить справочник", self.save)
 
     def restore_points(self) -> None:
@@ -168,11 +164,8 @@ class CatalogDialog(Modal):
             note += f" Страниц без текста: {blank_pages}."
         self.note.set(note)
 
-    def _remember_rule(self) -> None:
-        text = self.rules_text.get("1.0", "end-1c")
-        phrases = tuple(dict.fromkeys(line.strip() for line in text.splitlines() if line.strip()))
-        if phrases != self.shown_rule:
-            self.rules[self.editing_group] = phrases
+    def _update_rules(self, entries: tuple[RecognitionRule, ...]) -> None:
+        self.rules[self.editing_group] = entries
 
     def _draft(self) -> Catalog:
         try:
@@ -183,17 +176,11 @@ class CatalogDialog(Modal):
 
     def _load_rule(self) -> None:
         catalog = self._draft()
-        self.shown_rule = catalog.recognition_phrases(self.editing_group)
-        _set_text(self.rules_text, "\n".join(self.shown_rule))
+        self.rule_editor.load(catalog.recognition_rules(self.editing_group), construction=self.editing_group == 53)
         self.rule_description.set(_short(catalog.label(self.editing_group), 320))
 
     def _switch_rule(self, _event=None) -> None:
-        self._remember_rule()
         self.editing_group = GROUPS[self.rule_group.current()]
-        self._load_rule()
-
-    def _tab_changed(self, _event=None) -> None:
-        self._remember_rule()
         self._load_rule()
 
     def restore_rule(self) -> None:
@@ -204,7 +191,6 @@ class CatalogDialog(Modal):
             self._load_rule()
 
     def save(self) -> None:
-        self._remember_rule()
         text = self.points_text.get("1.0", "end-1c")
         try:
             points = parse_points(text)
@@ -225,80 +211,52 @@ class CatalogDialog(Modal):
         self.destroy()
 
 
-class StatementDialog(Modal):
-    def __init__(self, parent: tk.Misc, path: Path, sheet_names: tuple[str, ...]) -> None:
-        super().__init__(parent, "Импорт ведомости")
-        self.path = path
-        self.sheet = Sheet(())
-        self.warehouse = None
-        self.use_warehouse = tk.BooleanVar(value=False)
-        self.sales_choices = (SalesQuantity.UNKNOWN, SalesQuantity.OUTFLOW)
-        self.generic_note = ""
-        self.result: ImportedProducts | None = None
-        self.sheet_name = sheet_names[0]
-        self.minsize(760, 600)
+class SheetDialog(Modal):
+    def __init__(self, parent: tk.Misc, names: tuple[str, ...]) -> None:
+        super().__init__(parent, "Выбрать лист ведомости")
+        self.result: str | None = None
         body = self.body()
-        body.rowconfigure(4, weight=1)
-        ttk.Label(body, text="Проверьте столбцы ведомости", style="DialogTitle.TLabel").grid(row=0, sticky="w")
-        ttk.Label(body, text=_short(path.name, 85), style="Muted.TLabel").grid(row=1, sticky="w", pady=(3, 10))
+        ttk.Label(body, text="Какой лист открыть?", style="DialogTitle.TLabel").grid(row=0, sticky="w")
+        self.sheets = ttk.Combobox(body, state="readonly", width=42, values=names)
+        self.sheets.grid(row=1, sticky="ew", pady=(8, 0))
+        self.sheets.current(0)
+        self.footer(body, 2, "Открыть лист", self.submit)
+
+    def submit(self) -> None:
+        self.result = self.sheets.get()
+        self.destroy()
+
+
+class ColumnMappingDialog(Modal):
+    """Только для нераспознанных заголовков. Без просмотра исходных строк."""
+
+    def __init__(self, parent: tk.Misc, sheet: Sheet, plan: ImportPlan, sheet_name: str) -> None:
+        super().__init__(parent, "Указать столбцы ведомости")
+        self.sheet = sheet
+        self.result: ImportedProducts | None = None
+        body = self.body()
+        ttk.Label(body, text="Укажите недостающие столбцы", style="DialogTitle.TLabel").grid(row=0, sticky="w")
+        ttk.Label(body, text=f"Лист «{_short(sheet_name, 50)}»: не все поля определены автоматически.", style="Muted.TLabel").grid(
+            row=1, sticky="w", pady=(3, 10),
+        )
 
         settings = ttk.Frame(body)
         settings.grid(row=2, sticky="ew")
-        ttk.Label(settings, text="Лист").pack(side="left")
-        self.sheets = ttk.Combobox(settings, state="readonly", width=23, values=sheet_names)
-        self.sheets.current(0)
-        self.sheets.pack(side="left", padx=(5, 14))
-        self.sheets.bind("<<ComboboxSelected>>", self.load_sheet)
         ttk.Label(settings, text="Строки заголовка с").pack(side="left")
-        self.first = tk.StringVar(value="0")
-        self.last = tk.StringVar(value="0")
-        self.spins: list[ttk.Spinbox] = []
+        self.first = tk.StringVar(value=str(plan.first_header))
+        self.last = tk.StringVar(value=str(plan.last_header))
         for variable in (self.first, self.last):
             if variable is self.last:
                 ttk.Label(settings, text="по").pack(side="left")
-            spin = ttk.Spinbox(settings, from_=0, to=1, width=5, textvariable=variable, command=self.update_header)
+            spin = ttk.Spinbox(settings, from_=0, to=len(sheet.rows), width=5, textvariable=variable, command=self.update_header)
             spin.pack(side="left", padx=5)
             spin.bind("<Return>", self.update_header)
-            self.spins.append(spin)
-        self.update_button = ttk.Button(settings, text="Обновить", command=self.update_header)
-        self.update_button.pack(side="left", padx=(6, 0))
-        self.header_hint = tk.StringVar()
-        ttk.Label(
-            body, textvariable=self.header_hint, style="Muted.TLabel",
-        ).grid(row=3, sticky="w", pady=(6, 5))
-
-        view = ttk.Frame(body)
-        view.grid(row=4, sticky="nsew")
-        view.rowconfigure(0, weight=1)
-        view.columnconfigure(0, weight=1)
-        self.preview = ttk.Treeview(view, show="headings", height=5, selectmode="none")
-        self.preview.grid(row=0, column=0, sticky="nsew")
-        sx = ttk.Scrollbar(view, orient="horizontal", command=self.preview.xview)
-        sy = ttk.Scrollbar(view, orient="vertical", command=self.preview.yview)
-        self.preview.configure(xscrollcommand=sx.set, yscrollcommand=sy.set)
-        sx.grid(row=1, column=0, sticky="ew")
-        sy.grid(row=0, column=1, sticky="ns")
-
-        panel = ttk.Frame(body)
-        panel.grid(row=5, sticky="ew", pady=(10, 0))
-        self.profile_switch = ttk.Checkbutton(
-            panel, text="Профиль «Остатки ТМЦ на складах»", variable=self.use_warehouse, command=self._sync_mode,
+        ttk.Button(settings, text="Обновить заголовки", command=self.update_header).pack(side="left", padx=(6, 0))
+        ttk.Label(body, text="Для файла без заголовка укажите 0 и 0.", style="Muted.TLabel").grid(
+            row=3, sticky="w", pady=(4, 10),
         )
-        self.warehouse_panel = ttk.Frame(panel)
-        self.warehouse_fields = tk.StringVar()
-        ttk.Label(self.warehouse_panel, textvariable=self.warehouse_fields, wraplength=690).pack(anchor="w", pady=(0, 8))
-        ttk.Label(self.warehouse_panel, text="Источник количества продаж").pack(anchor="w")
-        self.sales = ttk.Combobox(self.warehouse_panel, state="readonly", width=60)
-        self.sales.pack(anchor="w", fill="x", pady=(3, 0))
-        self.sales.bind("<<ComboboxSelected>>", self._sync_sales)
-        self.month_fields = ttk.Frame(self.warehouse_panel)
-        ttk.Label(self.month_fields, text="Месяцы реализации: с").pack(side="left")
-        self.first_month = ttk.Combobox(self.month_fields, state="readonly", width=20)
-        self.first_month.pack(side="left", padx=6)
-        ttk.Label(self.month_fields, text="по").pack(side="left")
-        self.last_month = ttk.Combobox(self.month_fields, state="readonly", width=20)
-        self.last_month.pack(side="left", padx=6)
-        mapping = self.mapping = ttk.Frame(panel)
+        mapping = ttk.Frame(body)
+        mapping.grid(row=4, sticky="ew")
         mapping.columnconfigure(1, weight=1)
         self.columns: list[ttk.Combobox] = []
         for index, title in enumerate(SOURCE_COLUMNS):
@@ -306,101 +264,8 @@ class StatementDialog(Modal):
             combo = ttk.Combobox(mapping, width=42, state="readonly")
             combo.grid(row=index, column=1, sticky="ew", pady=2)
             self.columns.append(combo)
-        self.note = tk.StringVar()
-        ttk.Label(body, textvariable=self.note, wraplength=690, style="Muted.TLabel").grid(row=6, sticky="w", pady=(7, 0))
-        self.apply = self.footer(body, 7, "Построить таблицу", self.submit)
-        self.load_sheet()
-
-    def load_sheet(self, _event=None) -> None:
-        self.sheet_name = self.sheets.get()
-        self.configure(cursor="watch")
-        self.update_idletasks()
-        self.sheet = Sheet(())
-        self.warehouse = None
-        try:
-            self.sheet = read_sheet(self.path, self.sheet_name)
-            plan = guess_plan(self.sheet)
-        except StatementError as error:
-            self.generic_note = str(error)
-            plan = guess_plan(self.sheet)
-        else:
-            detected = sum(column is not None for column in plan.columns)
-            self.generic_note = (
-                f"Предложено столбцов: {detected} из 5. Проверьте поля и дополните пропуски. "
-                "«Расход» выбирайте только если он означает продажи."
-                if self.sheet.width >= 5 else "На листе меньше пяти столбцов. Выберите другой лист или проверьте файл."
-            )
-            self.warehouse = detect_warehouse_layout(self.sheet)
-        finally:
-            self.configure(cursor="")
-        if self.warehouse is not None and plan.first_header == 0:
-            plan = ImportPlan(self.warehouse.header_row, self.warehouse.header_row, plan.columns)
-        self.first.set(str(plan.first_header))
-        self.last.set(str(plan.last_header))
-        for spin in self.spins:
-            spin.configure(to=len(self.sheet.rows))
-        self.apply.state(["!disabled"] if self.sheet.width >= 5 else ["disabled"])
-        self.profile_switch.pack_forget()
-        self.mapping.pack_forget()
-        self.warehouse_panel.pack_forget()
-        self.use_warehouse.set(self.warehouse is not None and any(col is None for col in plan.columns))
-        if self.warehouse is not None:
-            self.profile_switch.pack(anchor="w", pady=(0, 7))
-            layout = self.warehouse
-            stock = get_column_letter(layout.ending_column + 1)
-            price = get_column_letter(layout.price_column + 1)
-            outflow = get_column_letter(layout.outflow_column + 1)
-            name = get_column_letter(layout.name_column + 1)
-            self.warehouse_fields.set(
-                (f"Период ведомости: {layout.source_period.label}. " if layout.source_period else "")
-                + f"Товар: {name}. Остаток: {stock}. Сумма остатка: {stock} × {price} (розничная цена)."
-            )
-            choices = ["Не заполнять — продажи явно не указаны"]
-            sources = [SalesQuantity.UNKNOWN]
-            if layout.months:
-                choices.append(f"Сложить количества за выбранные месяцы ({layout.months_label})")
-                sources.append(SalesQuantity.MONTHS)
-            choices.append(f"Взять «Расход» ({outflow}) за весь период")
-            sources.append(SalesQuantity.OUTFLOW)
-            self.sales_choices = tuple(sources)
-            self.sales.configure(values=choices)
-            self.sales.current(0)
-            labels = tuple(month.label for month in layout.months)
-            for combo in (self.first_month, self.last_month):
-                combo.configure(values=labels)
-                combo.set("")
-            if labels:
-                self.first_month.current(0)
-                self.last_month.current(len(labels) - 1)
-        self._sync_mode()
         self._render_header(plan)
-
-    def _sync_mode(self) -> None:
-        self.mapping.pack_forget()
-        self.warehouse_panel.pack_forget()
-        active = self.use_warehouse.get() and self.warehouse is not None
-        for widget in (*self.spins, self.update_button):
-            widget.state(["disabled"] if active else ["!disabled"])
-        if active:
-            self.warehouse_panel.pack(fill="x")
-            self.header_hint.set(f"Распознана ведомость ТМЦ · заголовок в строке {self.warehouse.header_row}.")
-            self._sync_sales()
-        else:
-            self.mapping.pack(fill="x")
-            self.header_hint.set("0 и 0 — без заголовка. Ниже показаны строки исходного листа.")
-            self.note.set(self.generic_note)
-
-    def _sync_sales(self, _event=None) -> None:
-        index = self.sales.current()
-        using_months = index >= 0 and self.sales_choices[index] == SalesQuantity.MONTHS
-        self.month_fields.pack_forget()
-        if using_months:
-            self.month_fields.pack(fill="x", pady=(6, 0))
-        source_note = (
-            "Выберите месяцы, только если эти количества — продажи. Для раннего конца периода остатков нет."
-            if using_months else "«Расход» может включать не только продажи; он относится ко всему периоду."
-        )
-        self.note.set(source_note + " Фактической суммы продаж в ведомости нет.")
+        self.footer(body, 5, "Показать отчёт", self.submit)
 
     def _current_plan(self) -> ImportPlan:
         try:
@@ -411,33 +276,13 @@ class StatementDialog(Modal):
 
     def _render_header(self, plan: ImportPlan) -> None:
         labels = column_headers(self.sheet, plan.first_header, plan.last_header)
-        letters = [get_column_letter(index + 1) for index in range(self.sheet.width)]
-        values = ["— выбрать столбец —", *(
-            letter + (f" · {_short(label, 95)}" if label else "") for letter, label in zip(letters, labels)
+        values = ["Не выбрано", *(
+            get_column_letter(index + 1) + (f" · {_short(label, 85)}" if label else "")
+            for index, label in enumerate(labels)
         )]
         for combo, column in zip(self.columns, plan.columns):
             combo.configure(values=values)
             combo.current(0 if column is None else column + 1)
-
-        # Остальные колонки по-прежнему доступны в списках сопоставления.
-        letters = letters[:30]
-        self.preview.delete(*self.preview.get_children())
-        self.preview.configure(columns=("row", *letters))
-        self.preview.heading("row", text="Строка")
-        self.preview.column("row", width=56, stretch=False, anchor="e")
-        for letter in letters:
-            self.preview.heading(letter, text=letter)
-            self.preview.column(letter, width=125, stretch=False)
-        start = max(0, plan.first_header - 2)
-        stop = min(len(self.sheet.rows), max(plan.last_header + 5, start + 8))
-        indices = sorted(set(range(start, min(start + 8, stop))) | set(range(max(start, stop - 5), stop)))
-        for index in indices:
-            row = self.sheet.rows[index]
-            self.preview.insert("", "end", values=(index + 1, *(
-                "" if (value := cell_at(row, col)) is None else _short(" ".join(str(value).split()), 80)
-                for col in range(len(letters))
-            )))
-        self.preview.yview_moveto(0)
 
     def update_header(self, _event=None) -> None:
         try:
@@ -449,12 +294,7 @@ class StatementDialog(Modal):
         self.configure(cursor="watch")
         self.update_idletasks()
         try:
-            if self.use_warehouse.get() and self.warehouse is not None:
-                source = self.sales_choices[self.sales.current()]
-                month_range = (self.first_month.current(), self.last_month.current()) if source == SalesQuantity.MONTHS else None
-                self.result = import_warehouse_products(self.sheet, self.warehouse, source, month_range)
-            else:
-                self.result = import_products(self.sheet, self._current_plan())
+            self.result = import_products(self.sheet, self._current_plan())
         except StatementError as error:
             messagebox.showerror("Проверьте ведомость", str(error), parent=self)
         finally:

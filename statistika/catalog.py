@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -18,6 +19,8 @@ HOSIERY = 100
 GROUPS = (*PDF_GROUPS, HOSIERY)
 HOSIERY_DESCRIPTION = "Чулочно-носочные изделия"
 DEFAULT_CATALOG = Path(__file__).parent / "data" / "catalog.json"
+# v2 записывал и нетронутые встроенные списки. Обновляем только точную копию прежнего №53.
+_ORIGINAL_53_V2 = "0b8fdf9521a8d6ad3715368a9a494923da6cb21f06ad71b23cb9db0ca0ea470a"
 GROUP_NAMES_4_TORG = {
     35: "Вина виноградные",
     36: "Вина плодовые и фруктово-ягодные",
@@ -40,10 +43,61 @@ class CatalogError(ValueError):
     """Ошибка, которую можно показать пользователю."""
 
 
+def clean_phrase(text: str) -> str:
+    """Убрать символы разметки перед фразой, не меняя обозначения вроде SDS+ и 0%."""
+    return " ".join(text.split()).lstrip(" ^!#•✓✔☑").strip()
+
+
+@dataclass(frozen=True)
+class RecognitionRule:
+    phrase: str
+    at_start: bool = False
+    exclude: bool = False
+    also: tuple[str, ...] = ()
+    also_at_start: tuple[str, ...] = ()
+    internal_only: bool = False
+
+
+def _legacy_rule(line: str) -> RecognitionRule | None:
+    """Перенос условий v1/v2 из текстовой записи в отдельные поля."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    excluded = line.startswith("!")
+    segments = re.split(r"\s+\+\s+", line[1:].strip() if excluded else line)
+    parts = [(clean_phrase(term), term.lstrip().startswith("^")) for term in segments]
+    if not all(phrase and any(ch.isalnum() for ch in phrase) for phrase, _ in parts):
+        return None
+    (phrase, at_start), *extra = parts
+    return RecognitionRule(phrase, at_start, excluded, tuple(p for p, start in extra if not start),
+                           tuple(p for p, start in extra if start))
+
+
+def _read_rule(value: object) -> RecognitionRule:
+    if not isinstance(value, dict) or not isinstance(value.get("phrase"), str):
+        raise ValueError("некорректная фраза распознавания")
+    phrase = clean_phrase(value["phrase"])
+    at_start, exclude, internal_only = (value.get(key, False) for key in ("at_start", "exclude", "internal_only"))
+    if not any(ch.isalnum() for ch in phrase) or not all(isinstance(flag, bool) for flag in (at_start, exclude, internal_only)):
+        raise ValueError("некорректные поля правила")
+
+    def extras(key: str) -> tuple[str, ...]:
+        phrases = value.get(key, [])
+        if not isinstance(phrases, list) or not all(isinstance(p, str) and any(ch.isalnum() for ch in p) for p in phrases):
+            raise ValueError("некорректные уточнения правила")
+        return tuple(clean_phrase(p) for p in phrases)
+
+    return RecognitionRule(phrase, at_start, exclude, extras("also"), extras("also_at_start"), internal_only)
+
+
+def _write_rule(rule: RecognitionRule) -> dict[str, object]:
+    return {key: value for key, value in asdict(rule).items() if value}
+
+
 @dataclass(frozen=True)
 class Catalog:
     points: dict[int, str] = field(default_factory=dict)
-    rules: dict[int, tuple[str, ...]] = field(default_factory=dict)
+    rules: dict[int, tuple[RecognitionRule, ...]] = field(default_factory=dict)
     source: str = ""
 
     def description(self, number: int) -> str:
@@ -62,7 +116,7 @@ class Catalog:
     def is_official_group(self, number: int) -> bool:
         return number in self.points and self.points[number] == builtin_catalog().points.get(number)
 
-    def default_phrases(self, number: int) -> tuple[str, ...]:
+    def default_rules(self, number: int) -> tuple[RecognitionRule, ...]:
         if number == HOSIERY or self.is_official_group(number):
             return builtin_catalog().rules.get(number, ())
         description = self.points.get(number, "")
@@ -70,11 +124,11 @@ class Catalog:
         if _LIMITS.search(description) or any(char in description for char in "(["):
             return ()
         phrases = (part.strip(" .:-—–") for part in re.split(r"[,;]", description))
-        return tuple(phrase for phrase in phrases if len(phrase) >= 3 and phrase.casefold() not in _GENERIC)
+        return tuple(RecognitionRule(phrase) for phrase in phrases if len(phrase) >= 3 and phrase.casefold() not in _GENERIC)
 
-    def recognition_phrases(self, number: int) -> tuple[str, ...]:
+    def recognition_rules(self, number: int) -> tuple[RecognitionRule, ...]:
         # Сохранённый пустой список отключает распознавание, а не включает встроенное заново.
-        return self.rules[number] if number in self.rules else self.default_phrases(number)
+        return self.rules[number] if number in self.rules else self.default_rules(number)
 
     @property
     def missing(self) -> tuple[int, ...]:
@@ -147,14 +201,20 @@ def local_catalog_path() -> Path:
 def _read_catalog(path: Path) -> tuple[Catalog, int]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or data.get("version") not in (1, 2):
+        if not isinstance(data, dict) or data.get("version") not in (1, 2, 3):
             raise ValueError("неподдерживаемая версия")
         points = {int(number): " ".join(text.split()) for number, text in data["points"].items()}
         rules = {}
         for number, phrases in data.get("rules", {}).items():
             if int(number) not in GROUPS or not isinstance(phrases, list):
                 raise ValueError(f"недопустимое правило для группы {number}")
-            rules[int(number)] = tuple(phrase.strip() for phrase in phrases if phrase.strip())
+            if data["version"] < 3:
+                entries = tuple(rule for phrase in phrases if (rule := _legacy_rule(phrase)) is not None)
+            else:
+                entries = tuple(_read_rule(rule) for rule in phrases)
+            if int(number) != 53 and any(rule.internal_only for rule in entries):
+                raise ValueError("режим внутренней стройгруппы доступен только для №53")
+            rules[int(number)] = entries
         if any(number < 1 or not text for number, text in points.items()):
             raise ValueError("непустое описание и положительный номер обязательны")
         source = data.get("source", "")
@@ -173,25 +233,30 @@ def builtin_catalog() -> Catalog:
 def load_catalog(path: Path) -> Catalog:
     default = builtin_catalog()
     if not path.exists():
-        return default
+        return replace(default, rules={})
     local, version = _read_catalog(path)
     if not local.points and not local.source:
         local = replace(local, points=default.points, source=default.source)
     if version == 1:
-        # В v1 пользовательские фразы дополняли встроенные. В v2 можно изменить весь список.
+        # В v1 пользовательские фразы дополняли встроенные. С v2 сохраняется весь список.
         local = replace(local, rules={
-            number: tuple(dict.fromkeys((*local.default_phrases(number), *phrases)))
+            number: tuple(dict.fromkeys((*local.default_rules(number), *phrases)))
             for number, phrases in local.rules.items()
         })
+    if version == 2 and local.is_official_group(53) and local.rules.get(53):
+        entries = [_write_rule(rule) for rule in local.rules[53]]
+        serialized = json.dumps(entries, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if hashlib.sha256(serialized.encode("utf-8")).hexdigest() == _ORIGINAL_53_V2:
+            local = replace(local, rules={number: rules for number, rules in local.rules.items() if number != 53})
     return local
 
 
 def save_catalog(catalog: Catalog, path: Path) -> None:
     data = {
-        "version": 2,
+        "version": 3,
         "source": catalog.source,
         "points": catalog.points,
-        "rules": catalog.rules,
+        "rules": {number: [_write_rule(rule) for rule in rules] for number, rules in catalog.rules.items()},
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None

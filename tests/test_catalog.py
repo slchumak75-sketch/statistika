@@ -1,3 +1,5 @@
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -5,7 +7,8 @@ from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from statistika.catalog import (
-    GROUPS, PDF_GROUPS, Catalog, CatalogError, extract_pdf_text, format_points, load_catalog, parse_points, save_catalog,
+    GROUPS, PDF_GROUPS, Catalog, CatalogError, RecognitionRule, builtin_catalog, extract_pdf_text, format_points,
+    load_catalog, parse_points, save_catalog,
 )
 
 
@@ -53,14 +56,14 @@ def test_instruction_parser_keeps_wrapping_and_drops_chapter_titles():
 
 def test_empty_prototype_catalog_does_not_hide_builtin_points(tmp_path):
     local = tmp_path / "catalog.json"
-    save_catalog(Catalog(rules={35: ("особое наименование",)}), local)
+    save_catalog(Catalog(rules={35: (RecognitionRule("особое наименование"),)}), local)
     upgraded = load_catalog(local)
-    assert upgraded.missing == () and upgraded.rules[35] == ("особое наименование",)
+    assert upgraded.missing == () and upgraded.rules[35] == (RecognitionRule("особое наименование"),)
 
 
 def test_saved_catalog_is_loaded_on_restart(tmp_path):
     path = tmp_path / "Статистика" / "catalog.json"
-    catalog = Catalog({2: "Другой пункт", 35: "Чай", 36: "Описание"}, {35: ("чай зелёный",)}, "Справочник.pdf")
+    catalog = Catalog({2: "Другой пункт", 35: "Чай", 36: "Описание"}, {35: (RecognitionRule("чай зелёный"),)}, "Справочник.pdf")
     save_catalog(catalog, path)
     assert load_catalog(path) == catalog
     assert "чай зелёный" in path.read_text(encoding="utf-8")
@@ -106,9 +109,6 @@ def test_pdf_without_text_explains_ocr(tmp_path):
 
 
 def test_legacy_rules_extend_defaults_and_cleared_lists_stay_empty(tmp_path):
-    import json
-
-    from statistika.catalog import builtin_catalog
     from statistika.classifier import Classifier
 
     path = tmp_path / 'catalog.json'
@@ -127,3 +127,52 @@ def test_legacy_rules_extend_defaults_and_cleared_lists_stay_empty(tmp_path):
     assert classifier.group_for("Антисептик") is None
     assert classifier.group_for("Носки") is None
     assert classifier.group_for("Пиво") == 40
+
+
+def test_v2_marked_rules_migrate_without_broadening_matches(tmp_path):
+    from statistika.classifier import Classifier
+
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps({
+        "version": 2, "points": builtin_catalog().points, "source": builtin_catalog().source,
+        "rules": {"53": ["# Черновик не работает", "^шпатель + фасадный", "!для депиляции",
+                         "^сверло SDS+", "водосток + ^комплект"], "100": []},
+    }), encoding="utf-8")
+    catalog = load_catalog(path)
+    assert catalog.recognition_rules(53) == (
+        RecognitionRule("шпатель", at_start=True, also=("фасадный",)),
+        RecognitionRule("для депиляции", exclude=True),
+        RecognitionRule("сверло SDS+", at_start=True),
+        RecognitionRule("водосток", also_at_start=("комплект",)),
+    )
+    classifier = Classifier(catalog)
+    assert classifier.group_for("Шпатель фасадный") == 53
+    assert classifier.group_for("Шпатель фасадный для депиляции") is None
+    assert classifier.group_for("Черновик не работает") is None
+    assert classifier.group_for("Комплект для водостока") == 53
+    assert classifier.group_for("Лейка, комплект для водостока") is None
+    assert classifier.group_for("Американка 1/2 Kalde") is None  # Изменённый список — не исходный.
+    assert classifier.group_for("Носки") is None
+    save_catalog(catalog, path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["version"] == 3 and data["rules"]["100"] == []
+    assert data["rules"]["53"][0] == {"phrase": "шпатель", "at_start": True, "also": ["фасадный"]}
+    assert load_catalog(path) == catalog
+
+
+def test_unchanged_builtin_v2_list_can_follow_new_defaults_without_touching_custom_rules(tmp_path, monkeypatch):
+    from statistika import catalog as catalog_module
+
+    original = [{"phrase": "старый термин"}]
+    fingerprint = hashlib.sha256(json.dumps(original, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    monkeypatch.setattr(catalog_module, "_ORIGINAL_53_V2", fingerprint)
+    data = {"version": 2, "points": builtin_catalog().points, "rules": {"53": ["старый термин"], "35": ["свой термин"], "100": []}}
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    catalog = load_catalog(path)
+    assert 53 not in catalog.rules
+    assert catalog.recognition_rules(53) == builtin_catalog().recognition_rules(53)
+    assert catalog.rules[35] == (RecognitionRule("свой термин"),) and catalog.rules[100] == ()
+    data["rules"]["53"].append("свой второй термин")
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert load_catalog(path).rules[53] == (RecognitionRule("старый термин"), RecognitionRule("свой второй термин"))

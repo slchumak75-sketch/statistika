@@ -2,7 +2,7 @@ import pytest
 
 from dataclasses import replace
 
-from statistika.catalog import GROUPS, Catalog, PDF_GROUPS, builtin_catalog
+from statistika.catalog import GROUPS, Catalog, PDF_GROUPS, RecognitionRule, builtin_catalog
 from statistika.classifier import Classifier
 
 
@@ -72,7 +72,7 @@ def test_official_rules_not_attached_to_unrelated_pdf_numbering():
 
 def test_conflicting_custom_alias_leaves_official_match_unassigned():
     official = builtin_catalog()
-    catalog = replace(official, rules={**official.rules, 100: ("водка",)})
+    catalog = replace(official, rules={**official.rules, 100: (RecognitionRule("водка"),)})
     assert Classifier(catalog).group_for("Водка 0,5л") is None
 
 
@@ -120,3 +120,76 @@ def test_every_builtin_group_is_backed_by_editable_phrases(group, sample):
     assert Classifier(catalog).group_for(sample) == group
     updated = replace(catalog, rules={**catalog.rules, group: ()})
     assert Classifier(updated).group_for(sample) is None
+
+
+@pytest.mark.parametrize(("name", "expected"), [
+    ("Американка 1/2 прямая Kalde", 53),
+    ("Американка ПП нар. 32х3/4", 53),
+    ("Кран шар латун Ду 15 с америк.", 53),
+    ("Ключ для разъемных соед. американок 1/2-1 1/4", 53),
+    ("Труба канализ. ПВХ 110*2,2*1000мм", 53),
+    ("Колено кан. наруж.ПП 110/45", 53),
+    ("Тройник 15 БФИП внутр рез", 53),
+    ("Кран Маевского 1/2 д/радиатора", 53),
+    ("Уголок крепеж.52*52*45*2,0", 53),
+    ("Пластина креп. 140*55*2,0", 53),
+    ("Петля рояльная L 250 цинк", 53),
+    ("Кисть Economy + 100*15", 53),
+    ("Кисть плоская 2-50мм SM", 53),
+    ("Ролик нитяной 10см D15 Baulux под руч.д6", 53),
+    ("Валик прижимной резиновый 180мм", 53),
+    ("Шпательная лопатка 100мм ПРОФИ нерж.ст.", 53),
+    ("Клещи-автомат для снятия изоляции", 53),
+    ("Дрель электрическая WERKER ID 810", 53),
+    ("Лопата совковая цельномет.1150мм STARTUL", 53),
+    ("Угол 10*10 2,7м Идеал белый", 53),
+    ("Стык береза 38мм 0,9", 53),
+    ("Плита ППТ 15Н-А-Р 1000*1000*50мм", 53),
+    ("Плита OSB 12*1250*2500", 53),
+    ("Подкровельная пленка B 30м2 ONDUTISS", 53),
+    ("Вентрешетка 135х135мм П Storm", 53),
+    ("Пена монтаж. быт. WUNDER Foam 335мл.всес.", 53),
+    ("Клей монт. черн. POINT 290мл. 105 морской", 53),
+    ("Клей ПВА строит. GOLDBASTIK BF 07 1л.", 53),
+    ("Краска ВД акриловая для кухни и ван. 3кг. FARBITEX", 53),
+    ("Лак битумный БТ-577 0,5л", 53),
+    ("Кисть д/рисования ArtSpace №1", None),
+    ("Кисть силиконовая кондитерская", None),
+    ("Ролик для одежды 50л. MF", None),
+    ("Валик для массажа", None),
+    ("Решетка для барбекю ECOS-RD-103С", None),
+    ("Плитка эл. Blackton Bt HP101W", None),
+    ("Плита газовая 2-х конф.", None),
+    ("Клей ПВА Kores 60мл", None),
+    ("Клей для грызунов и насек. 135гр.", None),
+    ("Клей ПВА канцелярский DEKOR", None),
+    ("Лак для волос POWER 225мл Тафт", None),
+    ("Грунт для рассады 25л.", None),
+    ("Лопата совковая игрушечная для песка", None),
+    ("Тройник 4гн.б/з", None),
+])
+def test_whole_inventory_audit_adds_context_specific_construction_families(name, expected):
+    classifier = Classifier(builtin_catalog())
+    assert classifier.group_for(name) == expected
+
+
+@pytest.mark.parametrize("name", [
+    "Автомат ВА 47-29 1п 16А IEK", "Автомат АЕ 2045М 25А", "Диф.авт.выкл.АД-12 16А",
+    "Выключатель дифф.авт.АВДТ-63/2Р С25", "УЗО ВД1-63 2Р 25А 30мА IEK",
+    "Кабель АВВГ-4*16", "Кабель-канал 25*16", "Провод ПВС 3*1,5", "Розетка 7-202-01 с/з",
+    "Выключатель 2 клав. 6А бел.Пралеска Аква",
+])
+def test_electrical_installation_rules_are_opt_in(name):
+    catalog = builtin_catalog()
+    assert Classifier(catalog).group_for(name) is None
+    assert Classifier(catalog, include_electrical=True).group_for(name) == 53
+    removed = replace(catalog, rules={**catalog.rules, 53: tuple(r for r in catalog.rules[53] if not r.internal_only)})
+    assert Classifier(removed, include_electrical=True).group_for(name) is None
+
+
+@pytest.mark.parametrize("name", [
+    "Автомат игрушечный", "Автомат для продажи кофе", "Автомат", "Розетка для варенья 100мл",
+    "Триммерная головка автомат", "Лампа галог. GU10 50W", "Стиральный порошок автомат", "Ламинат Дуб 33 класс",
+])
+def test_electrical_addon_does_not_capture_unrelated_homonyms(name):
+    assert Classifier(builtin_catalog(), include_electrical=True).group_for(name) != 53

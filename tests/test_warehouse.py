@@ -136,3 +136,24 @@ def test_selected_months_and_end_stock_date_cannot_be_confused():
         import_warehouse_products(data, layout, SalesQuantity.MONTHS, (1, 0))
     with pytest.raises(StatementError, match="Расход.*за весь период"):
         import_warehouse_products(data, layout, SalesQuantity.OUTFLOW, (0, 0))
+
+
+def test_period_changes_keep_rows_with_only_later_or_outflow_quantities():
+    data = Sheet((
+        ("С 01.10.26 по 15.11.26",), _HEADERS,
+        stock_row("Муфта PPR 40 мм", None, None, None, (None, 4), warehouse="Мир"),
+        stock_row("Муфта PPR 40 мм", 2, None, None, (None, None), warehouse="Кореличи"),
+        stock_row("Нет показателей", " — ", "－", "15", (None, "−")),
+    ))
+    layout = detect_warehouse_layout(data)
+    for source, months, expected in (
+        (SalesQuantity.MONTHS, (0, 0), (None, None)),
+        (SalesQuantity.MONTHS, (1, 1), (4, None)),
+        (SalesQuantity.UNKNOWN, None, (None, None)),
+        (SalesQuantity.OUTFLOW, None, (None, 2)),
+    ):
+        result = import_warehouse_products(data, layout, source, months)
+        assert [item.warehouse for item in result.products] == ["Мир", "Кореличи"]
+        assert tuple(p.sold_quantity for p in result.products) == expected
+        assert result.skipped_no_values == 1
+        assert all(p.metrics[1:] == (None, None, None) for p in result.products)

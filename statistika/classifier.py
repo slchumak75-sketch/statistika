@@ -10,12 +10,11 @@ from functools import lru_cache
 
 from snowballstemmer.russian_stemmer import RussianStemmer
 
-from statistika.catalog import GROUPS, Catalog
+from statistika.catalog import GROUPS, Catalog, RecognitionRule
 
 _WORDS = re.compile(r"\d+(?:[.,]\d+)?\s*%|[^\W_]+", re.UNICODE)
 _FOR = re.compile(r"\bд\s*[/\\]\s*")
 _VOLUME = re.compile(r"(?<=\d)(?=(?:кг|мл|л)\b)")
-_AND = re.compile(r"\s+\+\s+")  # «SDS+» и похожая пунктуация остаются частью фразы.
 _CODE = re.compile(r"\d{1,3}")
 _STEMMER = RussianStemmer()
 
@@ -63,30 +62,24 @@ class Rule:
     excludes: bool
 
 
-def _rule(line: str, group: int) -> Rule | None:
-    line = line.strip()
-    if not line or line.startswith("#"):
+def _rule(rule: RecognitionRule, group: int) -> Rule | None:
+    first = Phrase(_tokens(rule.phrase), rule.at_start)
+    additional = tuple(Phrase(_tokens(phrase), False) for phrase in rule.also) + tuple(
+        Phrase(_tokens(phrase), True) for phrase in rule.also_at_start
+    )
+    if not first.words or any(not part.words for part in additional):
         return None
-    excludes = line.startswith("!")
-    if excludes:
-        line = line[1:].lstrip()
-    phrases = []
-    for part in _AND.split(line):
-        part = part.strip()
-        at_start = part.startswith("^")
-        words = _tokens(part[1:] if at_start else part)
-        if not words:
-            return None
-        phrases.append(Phrase(words, at_start))
-    return Rule(phrases[0], tuple(phrases[1:]), group, excludes)
+    return Rule(first, additional, group, rule.exclude)
 
 
 class Classifier:
-    def __init__(self, catalog: Catalog) -> None:
+    def __init__(self, catalog: Catalog, *, include_electrical: bool = False) -> None:
         by_word: dict[str, set[Rule]] = defaultdict(set)
         for group in GROUPS:
-            for line in catalog.recognition_phrases(group):
-                if rule := _rule(line, group):
+            for entry in catalog.recognition_rules(group):
+                if entry.internal_only and not include_electrical:
+                    continue
+                if rule := _rule(entry, group):
                     by_word[rule.first.words[0]].add(rule)
         self._by_word = dict(by_word)
 

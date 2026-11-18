@@ -10,6 +10,7 @@ from typing import Iterable
 from snowballstemmer.russian_stemmer import RussianStemmer
 
 from statistika.catalog import GROUPS, HOSIERY, HOSIERY_DESCRIPTION, PDF_GROUPS, Catalog
+from statistika.rules_4_torg import groups_for_4_torg
 
 _HOSIERY_TERMS = (
     HOSIERY_DESCRIPTION,
@@ -58,20 +59,20 @@ class Classifier:
                 if tokens:
                     entries[tokens[0]].add((tokens, number))
 
+        self._official = {number for number in PDF_GROUPS if catalog.is_official_group(number)}
         for number in PDF_GROUPS:
-            add(number, _description_terms(catalog.points.get(number, "")))
+            if number not in self._official:
+                add(number, _description_terms(catalog.points.get(number, "")))
         add(HOSIERY, _HOSIERY_TERMS)
         for number in GROUPS:
             add(number, catalog.rules.get(number, ()))
         self._by_start = dict(entries)
 
-    def group_for(self, name: str) -> int | None:
+    def group_for(self, name: str, nomenclature_group: str = "") -> int | None:
+        matches = groups_for_4_torg(name, nomenclature_group) & self._official if self._official else set()
         tokens = _tokens(name)
-        match: int | None = None
         for index, token in enumerate(tokens):
             for phrase, number in self._by_start.get(token, ()):
                 if tokens[index : index + len(phrase)] == phrase:
-                    if match is not None and match != number:
-                        return None
-                    match = number
-        return match
+                    matches.add(number)
+        return matches.pop() if len(matches) == 1 else None

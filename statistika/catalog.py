@@ -6,7 +6,8 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 
 from pypdf import PdfReader
@@ -17,6 +18,22 @@ HOSIERY = 100
 GROUPS = (*PDF_GROUPS, HOSIERY)
 HOSIERY_DESCRIPTION = "Чулочно-носочные изделия"
 DEFAULT_CATALOG = Path(__file__).parent / "data" / "catalog.json"
+GROUP_NAMES_4_TORG = {
+    35: "Вина виноградные",
+    36: "Вина плодовые и фруктово-ягодные",
+    37: "Вина игристые и Советское шампанское",
+    38: "Водка",
+    39: "Коньяки, бренди, арманьяк, дивины",
+    40: "Пиво",
+    41: "Ликёры и ликёро-водочные изделия",
+    42: "Слабоалкогольные напитки",
+    43: "Прочие алкогольные напитки",
+    45: "Минеральная и питьевая вода",
+    46: "Табачные изделия",
+    53: "Строительные материалы",
+    57: "Бытовая химия и автокосметика",
+    63: "Парфюмерия, косметика и гигиена",
+}
 
 
 class CatalogError(ValueError):
@@ -37,28 +54,43 @@ class Catalog:
     def label(self, number: int | None) -> str:
         return "" if number is None else f"№{number} — {self.description(number)}"
 
+    def short_label(self, number: int | None) -> str:
+        if number in GROUP_NAMES_4_TORG and self.is_official_group(number):
+            return f"№{number} — {GROUP_NAMES_4_TORG[number]}"
+        return self.label(number)
+
+    def is_official_group(self, number: int) -> bool:
+        return number in self.points and self.points[number] == builtin_catalog().points.get(number)
+
     @property
     def missing(self) -> tuple[int, ...]:
         return tuple(number for number in PDF_GROUPS if number not in self.points)
 
 
 # «35. Описание», «35) Описание», «№ 35 — Описание» и номера в
-# первом столбце текстовой таблицы (с пробелами, полученными из PDF).
-# Подпункты вроде «35.1» остаются частью текста предыдущего пункта.
+# первом столбце текстовой таблицы. Не считать «4-торг» и «35.1» пунктами.
 _POINT = re.compile(
     r"^\s*(?:№\s*)?(?P<number>[1-9][0-9]{0,3})"
-    r"(?:\s*[.)](?!\d)\s*|\s*[-–—]\s*|\s+(?=[^\W\d_]))(?P<text>\S.*)$"
+    r"(?:\s*[.)](?!\d)\s*|\s+[-–—]\s*|[-–—]\s+|\s+(?=[^\W\d_]))(?P<text>\S.*)$"
 )
+_DOTTED_POINT = re.compile(r"^(?P<number>[1-9][0-9]{0,3})\.\s+(?P<text>\S.*)$")
+_CHAPTER = re.compile(r"^глава\s+\d+$", re.I)
 
 
 def parse_points(text: str) -> dict[int, str]:
+    signature = " ".join(text.casefold().split())
+    instructions = "глава 1" in signature and "по заполнению формы" in signature and "4-торг" in signature
+    point_pattern = _DOTTED_POINT if instructions else _POINT
     chunks: dict[int, list[str]] = {}
     current: int | None = None
     for raw in text.splitlines():
         line = raw.strip()
         if not line or line.isdecimal():  # в том числе номера страниц
             continue
-        match = _POINT.match(line)
+        if instructions and _CHAPTER.fullmatch(line):
+            current = None  # Не переносить название следующей главы в предыдущий пункт.
+            continue
+        match = point_pattern.match(line)
         if match:
             current = int(match["number"])
             if current in chunks:
@@ -117,8 +149,21 @@ def read_catalog(path: Path) -> Catalog:
     return Catalog(points, rules, source)
 
 
+@lru_cache(maxsize=1)
+def builtin_catalog() -> Catalog:
+    return read_catalog(DEFAULT_CATALOG)
+
+
 def load_catalog(path: Path) -> Catalog:
-    return read_catalog(path if path.exists() else DEFAULT_CATALOG)
+    default = builtin_catalog()
+    if not path.exists():
+        return default
+    local = read_catalog(path)
+    # У первой сборки не было документа. Сохраняем добавленные правила,
+    # но не даём пустому справочнику прототипа скрыть встроенные пункты.
+    if not local.points and not local.source:
+        return replace(default, rules=local.rules)
+    return local
 
 
 def save_catalog(catalog: Catalog, path: Path) -> None:

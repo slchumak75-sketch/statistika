@@ -56,6 +56,7 @@ class Product:
     sold_amount: Decimal | None
     ending_quantity: Decimal | None
     ending_amount: Decimal | None
+    nomenclature_group: str = ""
 
     @property
     def metrics(self) -> tuple[Decimal | None, ...]:
@@ -68,6 +69,8 @@ class ImportedProducts:
     skipped_totals: int = 0
     skipped_headers: int = 0
     skipped_no_values: int = 0
+    summary: str = ""
+    column_notes: tuple[tuple[int, str], ...] = ()  # Номера столбцов результата с 1.
 
 
 def list_sheets(path: Path) -> tuple[str, ...]:
@@ -313,7 +316,8 @@ def parse_number(value: object) -> Decimal | None:
 
 
 def import_products(sheet: Sheet, plan: ImportPlan) -> ImportedProducts:
-    column_headers(sheet, plan.first_header, plan.last_header)  # проверка диапазона строк
+    labels = column_headers(sheet, plan.first_header, plan.last_header)
+    group_cols = [col for col, label in enumerate(labels) if _words(label) == ("группа", "номенклатуры")]
     if len(plan.columns) != len(SOURCE_COLUMNS) or any(
         col is None or not 0 <= col < sheet.width for col in plan.columns
     ):
@@ -359,7 +363,8 @@ def import_products(sheet: Sheet, plan: ImportPlan) -> ImportedProducts:
             except ValueError as error:
                 letter = get_column_letter(col + 1)
                 raise StatementError(f"Строка {number}, столбец {letter} («{label}»): не число — {value!r}.") from error
-        products.append(Product(name, *values))
+        group = _heading(cell_at(row, group_cols[0])) if len(group_cols) == 1 else ""
+        products.append(Product(name, *values, nomenclature_group=group))
     if not products:
         raise StatementError("Не найдено товарных строк. Проверьте лист, границы заголовка и выбранные столбцы.")
     return ImportedProducts(tuple(products), totals, repeated, no_values)

@@ -32,13 +32,30 @@ def test_duplicate_requires_review():
         parse_points("35. Описание\n35. Другое описание")
 
 
-def test_default_does_not_invent_source_data(tmp_path):
+def test_default_loads_all_confirmed_points(tmp_path):
     catalog = load_catalog(tmp_path / "catalog.json")
     assert catalog.label(100) == "№100 — Чулочно-носочные изделия"
-    assert all(catalog.points[number] for number in PDF_GROUPS if number not in catalog.missing)
-    # Пока подтверждённый документ не внесён в проект, штатный файл пуст.
-    if not catalog.source:
-        assert catalog.missing == PDF_GROUPS
+    assert catalog.source == "4-торг инст..pdf"
+    assert set(catalog.points) == set(range(1, 75))
+    assert catalog.missing == ()
+    assert "граппа, чача" in catalog.points[43]  # Продолжение на следующей странице.
+    assert parse_points(format_points(catalog.points)) == catalog.points
+
+
+def test_instruction_parser_keeps_wrapping_and_drops_chapter_titles():
+    text = (
+        "УКАЗАНИЯ\nпо  заполнению  формы  4-торг\n\nГЛАВА 1\nОБЩИЕ ПОЛОЖЕНИЯ\n"
+        "      1. Первый текст\n4-торг (продажа)\n2\nпродолжение пункта.\n"
+        "ГЛАВА 2\nСЛУЖЕБНЫЙ ЗАГОЛОВОК\n      2. Второй текст\n4 (текст о форме)"
+    )
+    assert parse_points(text) == {1: "Первый текст 4-торг (продажа) продолжение пункта.", 2: "Второй текст 4 (текст о форме)"}
+
+
+def test_empty_prototype_catalog_does_not_hide_builtin_points(tmp_path):
+    local = tmp_path / "catalog.json"
+    save_catalog(Catalog(rules={35: ("особое наименование",)}), local)
+    upgraded = load_catalog(local)
+    assert upgraded.missing == () and upgraded.rules[35] == ("особое наименование",)
 
 
 def test_saved_catalog_is_loaded_on_restart(tmp_path):

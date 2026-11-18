@@ -46,3 +46,32 @@ jobs:
           path: dist/Statistika.exe
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.event.head_commit.message, 'Release v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          name: Statistika-Windows-x64
+          path: dist
+      - name: Опубликовать проверенный EXE
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          subject=${COMMIT_MESSAGE%%$'\n'*}
+          if [[ ! "$subject" =~ ^Release\ (v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo 'Ожидается тема коммита Release vX.Y.Z' >&2
+            exit 1
+          fi
+          tag=${BASH_REMATCH[1]}
+          gh release create "$tag" 'dist/Statistika.exe#Statistika.exe · Windows x64' \
+            --target "$GITHUB_SHA" --title "Statistika $tag — Windows x64" \
+            --notes-file "docs/releases/$tag.md"

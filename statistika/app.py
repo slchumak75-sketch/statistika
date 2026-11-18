@@ -6,6 +6,7 @@ import argparse
 import tempfile
 import tkinter as tk
 import traceback
+from decimal import Decimal
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -18,6 +19,7 @@ _BG = "#f1f5fa"
 _INK = "#16304c"
 _MUTED = "#466078"
 _BLUE = "#174f91"
+_VIEWS = ("Все строки", "Только с группой", "Только без группы")
 
 
 def setup_theme(root: tk.Tk) -> None:
@@ -46,8 +48,9 @@ class MainWindow:
         self.catalog = Catalog()
         self.rows: list[ReportRow] = []
         self.source_path: Path | None = None
+        self.column_notes: tuple[tuple[int, str], ...] = ()
         self.dirty = False
-        self.only_unassigned = tk.BooleanVar(value=False)
+        self.view = tk.StringVar(value=_VIEWS[0])
         self.catalog_summary = tk.StringVar()
         self.source_text = tk.StringVar(value="Ведомость ещё не открыта")
         self.total_text = tk.StringVar(value="Строки: 0")
@@ -55,6 +58,7 @@ class MainWindow:
         self.unassigned_text = tk.StringVar(value="Без группы: 0")
         self.selection_text = tk.StringVar(value="Выбор группы: нажмите на первый столбец или клавишу Enter на выбранной строке.")
         self.export_text = tk.StringVar()
+        self.method_text = tk.StringVar()
 
         root.title("Статистика — продажи и остатки")
         root.geometry(f"{min(1240, root.winfo_screenwidth() - 55)}x{min(760, root.winfo_screenheight() - 100)}")
@@ -90,7 +94,9 @@ class MainWindow:
         self.export_button.pack(side="left", padx=8)
         self.edit_button = ttk.Button(actions, text="Изменить группу…", command=self.edit_selected)
         self.edit_button.pack(side="left")
-        ttk.Checkbutton(actions, text="Только без группы", variable=self.only_unassigned, command=self.redraw).pack(side="right")
+        view_selector = ttk.Combobox(actions, state="readonly", textvariable=self.view, values=_VIEWS, width=20)
+        view_selector.pack(side="right")
+        view_selector.bind("<<ComboboxSelected>>", lambda _event: self.redraw())
 
         stats = ttk.Frame(body)
         stats.grid(row=2, sticky="ew", pady=(0, 8))
@@ -125,6 +131,9 @@ class MainWindow:
         detail.grid(row=4, sticky="ew", pady=(10, 2))
         detail.bind("<Configure>", lambda event: detail.configure(wraplength=max(350, event.width - 2)))
         ttk.Label(body, textvariable=self.export_text, style="Muted.TLabel").grid(row=5, sticky="w")
+        method = ttk.Label(body, textvariable=self.method_text, wraplength=810, style="Muted.TLabel")
+        method.grid(row=6, sticky="ew", pady=(2, 0))
+        method.bind("<Configure>", lambda event: method.configure(wraplength=max(350, event.width - 2)))
 
     def update_catalog_summary(self) -> None:
         ready = len(PDF_GROUPS) - len(self.catalog.missing)
@@ -157,7 +166,12 @@ class MainWindow:
             return
         if not self.can_discard():
             return
-        dialog = StatementDialog(self.root, path, names)
+        self.root.configure(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            dialog = StatementDialog(self.root, path, names)
+        finally:
+            self.root.configure(cursor="")
         dialog.show()
         if dialog.result is not None:
             self.display_report(path, dialog.sheet_name, dialog.result)
@@ -167,7 +181,9 @@ class MainWindow:
         self.rows = [ReportRow(product) for product in result.products]
         refresh_groups(self.rows, self.catalog)
         self.dirty = False
-        self.only_unassigned.set(False)
+        self.view.set(_VIEWS[0])
+        self.column_notes = result.column_notes
+        self.method_text.set(result.summary)
         name = f"{path.name} · {sheet_name}"
         self.source_text.set(name if len(name) <= 66 else name[:65] + "…")
         self.export_text.set(f"Пропущено: итогов — {result.skipped_totals}, повторов заголовка — {result.skipped_headers}, "
@@ -177,26 +193,33 @@ class MainWindow:
     def redraw(self) -> None:
         self.tree.delete(*self.tree.get_children())
         visible = 0
+        view = self.view.get()
         for index, row in enumerate(self.rows):
-            if self.only_unassigned.get() and row.group is not None:
+            if not self.visible_in_view(row, view):
                 continue
             self.tree.insert("", "end", iid=str(index), values=(
-                self.catalog.label(row.group), row.product.name, *(display_number(value) for value in row.product.metrics),
+                self.catalog.short_label(row.group), row.product.name, *(display_number(value) for value in row.product.metrics),
             ), tags=("odd",) if visible % 2 else ())
             visible += 1
         self.refresh_counters()
         self.refresh_selection()
+
+    @staticmethod
+    def visible_in_view(row: ReportRow, view: str) -> bool:
+        return view == _VIEWS[0] or (view == _VIEWS[1] and row.group is not None) or (view == _VIEWS[2] and row.group is None)
 
     def refresh_counters(self) -> None:
         unassigned = sum(row.group is None for row in self.rows)
         self.total_text.set(f"Строки: {len(self.rows)}")
         self.assigned_text.set(f"С группой: {len(self.rows) - unassigned}")
         self.unassigned_text.set(f"Без группы: {unassigned}")
-        if self.rows and (not self.only_unassigned.get() or unassigned):
+        view = self.view.get()
+        available = (len(self.rows), len(self.rows) - unassigned, unassigned)[_VIEWS.index(view)]
+        if available:
             self.empty.place_forget()
         else:
-            self.empty.configure(text=("Все строки распределены по группам." if self.rows else
-                                       "Откройте ведомость, чтобы начать.\nОписания пунктов PDF загружаются через «Справочник групп»."))
+            self.empty.configure(text=("В этом фильтре нет строк." if self.rows else
+                                       "Откройте ведомость, чтобы начать.\nСправочник 4-торг уже встроен в программу."))
             self.empty.place(relx=0.5, rely=0.48, anchor="center")
         self.export_button.state(["!disabled"] if self.rows else ["disabled"])
 
@@ -239,7 +262,7 @@ class MainWindow:
         row.assign(dialog.number)
         self.dirty = True
         item = str(index)
-        if self.only_unassigned.get() and row.group is not None:
+        if not self.visible_in_view(row, self.view.get()):
             next_item = self.tree.next(item) or self.tree.prev(item)
             self.tree.delete(item)
             if next_item:
@@ -247,7 +270,7 @@ class MainWindow:
                 self.tree.focus(next_item)
                 self.tree.see(next_item)
         else:
-            self.tree.set(item, "group", self.catalog.label(row.group))
+            self.tree.set(item, "group", self.catalog.short_label(row.group))
         self.refresh_counters()
         self.refresh_selection()
         self.tree.focus_set()
@@ -270,7 +293,7 @@ class MainWindow:
         self.root.configure(cursor="watch")
         self.root.update_idletasks()
         try:
-            export_xlsx(path, self.rows, self.catalog)
+            export_xlsx(path, self.rows, self.catalog, self.column_notes)
         except (OSError, ValueError) as error:
             messagebox.showerror("Не удалось сохранить Excel", str(error), parent=self.root)
         else:
@@ -313,7 +336,7 @@ def _self_test(marker: Path) -> int:
                 assert [combo.current() for combo in mapper.columns] == [1, 2, 3, 4, 5]
                 mapper.submit()
                 assert mapper.result is not None
-                app.catalog = Catalog()  # Проверка базовых правил независимо от будущего PDF в ресурсе.
+                assert len(app.catalog.points) == 74 and not app.catalog.missing
                 app.display_report(statement, mapper.sheet_name, mapper.result)
                 root.update_idletasks()
                 assert [row.group for row in app.rows] == [100, None]
@@ -327,6 +350,25 @@ def _self_test(marker: Path) -> int:
                 app.rows[1].assign(editor.number)
                 export_xlsx(base / "result.xlsx", app.rows, app.catalog)
                 assert (base / "result.xlsx").is_file()
+                warehouse = base / "Остатки ТМЦ.csv"
+                warehouse.write_text(
+                    "Склад;Группа номенклатуры;Номенклатура;Начальный остаток;Приход;Расход;"
+                    "Конечный остаток;Розничная цена;Октябрь 2026 г.;Ноябрь 2026 г.\n"
+                    "Тест;Хозгруппа;Вино фрукт. 0,75л;2;3;2;3;4,80;4;1\n",
+                    encoding="utf-8",
+                )
+                mapper = StatementDialog(root, warehouse, list_sheets(warehouse))
+                assert mapper.use_warehouse.get() and mapper.sales.current() == 0
+                mapper.sales.current(1)
+                mapper.submit()
+                assert mapper.result is not None and mapper.result.column_notes
+                assert mapper.result.products[0].metrics == (5, None, 3, Decimal("14.4"))
+                app.display_report(warehouse, mapper.sheet_name, mapper.result)
+                assert app.rows[0].group == 36
+                app.view.set(_VIEWS[2])
+                app.redraw()
+                assert not app.tree.get_children()
+                export_xlsx(base / "warehouse-result.xlsx", app.rows, app.catalog, app.column_notes)
             finally:
                 root.destroy()
         marker.write_text("OK\n", encoding="utf-8")

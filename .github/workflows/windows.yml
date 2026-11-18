@@ -1,0 +1,48 @@
+name: Сборка Statistika для Windows
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: x64
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Зависимости
+        run: python -m pip install -r requirements-dev.txt
+      - name: Тесты
+        run: python -m pytest -q
+      - name: Упаковка EXE
+        run: python -m PyInstaller --clean --noconfirm --onefile --windowed --name Statistika --paths . --add-data "statistika/data/catalog.json:statistika/data" statistika/__main__.py
+      - name: Проверка запуска собранного EXE
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'dist/Statistika.exe').Path
+          $result = Join-Path $env:RUNNER_TEMP 'statistika-self-test.txt'
+          $process = Start-Process -FilePath $exe -ArgumentList ('--self-test "{0}"' -f $result) -Wait -PassThru
+          if (-not (Test-Path -LiteralPath $result)) {
+            throw "EXE не создал отчёт о запуске. Код: $($process.ExitCode)"
+          }
+          $log = Get-Content -LiteralPath $result -Raw
+          if ($process.ExitCode -ne 0 -or $log.Trim() -ne 'OK') {
+            throw "Проверка EXE не пройдена:`n$log"
+          }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Statistika-Windows-x64
+          path: dist/Statistika.exe
+          if-no-files-found: error
+          retention-days: 30

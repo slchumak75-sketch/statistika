@@ -103,3 +103,27 @@ def test_pdf_without_text_explains_ocr(tmp_path):
     _make_pdf(path, False)
     with pytest.raises(CatalogError, match="OCR"):
         extract_pdf_text(path)
+
+
+def test_legacy_rules_extend_defaults_and_cleared_lists_stay_empty(tmp_path):
+    import json
+
+    from statistika.catalog import builtin_catalog
+    from statistika.classifier import Classifier
+
+    path = tmp_path / 'catalog.json'
+    path.write_text(json.dumps({
+        "version": 1, "points": builtin_catalog().points, "source": builtin_catalog().source,
+        "rules": {"53": ["монтажная смесь опытная"]},
+    }), encoding="utf-8")
+    catalog = load_catalog(path)
+    assert Classifier(catalog).group_for("Антисептик") == 53
+    assert Classifier(catalog).group_for("Монтажная смесь опытная 10 кг") == 53
+    changed = Catalog(catalog.points, {**catalog.rules, 53: (), 100: ()}, catalog.source)
+    save_catalog(changed, path)
+    reloaded = load_catalog(path)
+    assert reloaded.rules[53] == reloaded.rules[100] == ()
+    classifier = Classifier(reloaded)
+    assert classifier.group_for("Антисептик") is None
+    assert classifier.group_for("Носки") is None
+    assert classifier.group_for("Пиво") == 40

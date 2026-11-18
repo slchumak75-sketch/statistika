@@ -62,6 +62,20 @@ class Catalog:
     def is_official_group(self, number: int) -> bool:
         return number in self.points and self.points[number] == builtin_catalog().points.get(number)
 
+    def default_phrases(self, number: int) -> tuple[str, ...]:
+        if number == HOSIERY or self.is_official_group(number):
+            return builtin_catalog().rules.get(number, ())
+        description = self.points.get(number, "")
+        # Для другого PDF предлагаем только явные термины без оговорок.
+        if _LIMITS.search(description) or any(char in description for char in "(["):
+            return ()
+        phrases = (part.strip(" .:-—–") for part in re.split(r"[,;]", description))
+        return tuple(phrase for phrase in phrases if len(phrase) >= 3 and phrase.casefold() not in _GENERIC)
+
+    def recognition_phrases(self, number: int) -> tuple[str, ...]:
+        # Сохранённый пустой список отключает распознавание, а не включает встроенное заново.
+        return self.rules[number] if number in self.rules else self.default_phrases(number)
+
     @property
     def missing(self) -> tuple[int, ...]:
         return tuple(number for number in PDF_GROUPS if number not in self.points)
@@ -75,6 +89,8 @@ _POINT = re.compile(
 )
 _DOTTED_POINT = re.compile(r"^(?P<number>[1-9][0-9]{0,3})\.\s+(?P<text>\S.*)$")
 _CHAPTER = re.compile(r"^глава\s+\d+$", re.I)
+_LIMITS = re.compile(r"\b(?:кроме|за исключением|исключая|не включая|не учт[её]нн\w*|только)\b", re.I)
+_GENERIC = frozenset(("товар", "товары", "изделие", "изделия", "продукция", "прочие", "другие", "наборы", "комплекты", "разные", "в том числе"))
 
 
 def parse_points(text: str) -> dict[int, str]:
@@ -128,10 +144,10 @@ def local_catalog_path() -> Path:
     return base / "Statistika" / "catalog.json"
 
 
-def read_catalog(path: Path) -> Catalog:
+def _read_catalog(path: Path) -> tuple[Catalog, int]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or data.get("version") != 1:
+        if not isinstance(data, dict) or data.get("version") not in (1, 2):
             raise ValueError("неподдерживаемая версия")
         points = {int(number): " ".join(text.split()) for number, text in data["points"].items()}
         rules = {}
@@ -146,29 +162,33 @@ def read_catalog(path: Path) -> Catalog:
             raise ValueError("некорректное имя источника")
     except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
         raise CatalogError(f"Не удалось открыть справочник «{path}»: {error}") from error
-    return Catalog(points, rules, source)
+    return Catalog(points, rules, source), data["version"]
 
 
 @lru_cache(maxsize=1)
 def builtin_catalog() -> Catalog:
-    return read_catalog(DEFAULT_CATALOG)
+    return _read_catalog(DEFAULT_CATALOG)[0]
 
 
 def load_catalog(path: Path) -> Catalog:
     default = builtin_catalog()
     if not path.exists():
         return default
-    local = read_catalog(path)
-    # У первой сборки не было документа. Сохраняем добавленные правила,
-    # но не даём пустому справочнику прототипа скрыть встроенные пункты.
+    local, version = _read_catalog(path)
     if not local.points and not local.source:
-        return replace(default, rules=local.rules)
+        local = replace(local, points=default.points, source=default.source)
+    if version == 1:
+        # В v1 пользовательские фразы дополняли встроенные. В v2 можно изменить весь список.
+        local = replace(local, rules={
+            number: tuple(dict.fromkeys((*local.default_phrases(number), *phrases)))
+            for number, phrases in local.rules.items()
+        })
     return local
 
 
 def save_catalog(catalog: Catalog, path: Path) -> None:
     data = {
-        "version": 1,
+        "version": 2,
         "source": catalog.source,
         "points": catalog.points,
         "rules": catalog.rules,

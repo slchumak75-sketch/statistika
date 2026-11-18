@@ -53,3 +53,57 @@ def test_manual_clear_remains_blank_and_no_amount_rounding_in_ui():
     assert display_number(row.product.ending_amount) == "2,005"
     assert display_number(row.product.ending_quantity) == "0"
     assert display_number(None) == ""
+
+
+def test_export_warehouse_scope_and_summary_do_not_add_unlike_units(tmp_path):
+    from statistika.catalog import GROUPS, builtin_catalog
+    from statistika.report import summarize_groups, warehouses
+    from statistika.statement import ReportPeriod
+
+    catalog = builtin_catalog()
+    products = [
+        Product("Шуруп", Decimal(0), None, Decimal(8), Decimal(16), "Мир", "шт."),
+        Product("Доска строганная", Decimal("2.5"), None, Decimal("4.5"), Decimal(20), "Мир", "м"),
+        Product("Дюбель", None, None, Decimal(2), None, "Мир", "шт."),
+        Product("Саморез", Decimal(5), None, Decimal(11), Decimal(22), "Кореличи", "шт."),
+        Product("Другой товар", None, None, None, None, "Мир"),
+    ]
+    rows = [ReportRow(product) for product in products]
+    refresh_groups(rows, catalog)
+    assert warehouses(rows) == ("Кореличи", "Мир")
+    index = GROUPS.index(53)
+    summary = summarize_groups((rows[0], rows[1], rows[2], rows[4]))[index]
+    assert summary.group == 53 and summary.lines == 3
+    assert [(unit.unit, unit.sold.value, unit.ending.value) for unit in summary.units] == [("шт.", 0, 10), ("м", Decimal("2.5"), Decimal("4.5"))]
+    assert summary.units[0].sold.partial and not summary.units[0].ending.partial
+    assert summary.sold_amount.value is None and summary.sold_amount.known == 0
+    assert summary.ending_amount.value == 36 and summary.ending_amount.partial
+
+    target = tmp_path / "Склад Мир.xlsx"
+    export_xlsx(target, rows, catalog, period=ReportPeriod("Ноябрь 2026", ("Ноябрь 2026",), "15.11.2026"), warehouse="Мир")
+    workbook = load_workbook(target)
+    try:
+        detail, group_sheet = workbook.worksheets
+        assert detail.max_column == 6 and detail.max_row == 5
+        assert [detail.cell(number, 2).value for number in range(2, 6)] == ["Шуруп", "Доска строганная", "Дюбель", "Другой товар"]
+        assert detail["E3"].data_type == "n" and detail["E3"].value == 4.5 and ' м"' in detail["E3"].number_format
+        assert detail["A5"].value is None
+        assert "шт." in detail["C1"].value and "руб." in detail["D1"].value
+        assert group_sheet["B1"].value == "Мир" and group_sheet["B2"].value == "Ноябрь 2026"
+        assert group_sheet["B3"].value == "15.11.2026"
+        report_line = group_sheet[6 + index]
+        assert [cell.value for cell in report_line] == ["№53 — Строительные материалы", 3, "0* шт.\n2,5 м", None, "10 шт.\n4,5 м", 36]
+        assert '*' in report_line[-1].number_format
+        assert group_sheet[group_sheet.max_row][0].value == "Без группы"
+    finally:
+        workbook.close()
+
+
+def test_unknown_units_do_not_produce_a_quantity_total():
+    from statistika.catalog import GROUPS
+    from statistika.report import summarize_groups
+
+    rows = [ReportRow(Product("Товар", Decimal(7), Decimal(9), Decimal(8), Decimal(10)), 53)] * 2
+    total = summarize_groups(rows)[GROUPS.index(53)]
+    assert total.units[0].sold.value is None and total.units[0].ending.value is None
+    assert total.sold_amount.value == 18 and total.ending_amount.value == 20

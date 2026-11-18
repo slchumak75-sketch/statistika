@@ -1,28 +1,22 @@
-"""Прозрачная эвристика: совпадения по словам, неоднозначность оставляем оператору."""
+"""Сопоставление названий с редактируемыми фразами справочника."""
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import defaultdict
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import Iterable
 
 from snowballstemmer.russian_stemmer import RussianStemmer
 
-from statistika.catalog import GROUPS, HOSIERY, HOSIERY_DESCRIPTION, PDF_GROUPS, Catalog
-from statistika.rules_4_torg import groups_for_4_torg
+from statistika.catalog import GROUPS, Catalog
 
-_HOSIERY_TERMS = (
-    HOSIERY_DESCRIPTION,
-    "носки", "носок", "носочки", "носочек", "чулки", "чулок", "колготки", "колготок", "колготы",
-    "гольфы", "полугольфы", "получулки", "получулок", "подследники", "следки", "гетры",
-    "термоноски", "термоносок", "термогольфы", "термоколготки", "термоколготок",
-)
-_WORDS = re.compile(r"[^\W_]+", re.UNICODE)
-_LIMITS = re.compile(r"\b(?:кроме|за исключением|исключая|не включая|не учтенн\w*|только)\b", re.I)
-_GENERIC = {
-    "товары", "изделия", "продукция", "прочие", "другие", "наборы", "комплекты", "разные", "в том числе",
-}
+_WORDS = re.compile(r"\d+(?:[.,]\d+)?\s*%|[^\W_]+", re.UNICODE)
+_FOR = re.compile(r"\bд\s*[/\\]\s*")
+_VOLUME = re.compile(r"(?<=\d)(?=(?:кг|мл|л)\b)")
+_AND = re.compile(r"\s+\+\s+")  # «SDS+» и похожая пунктуация остаются частью фразы.
+_CODE = re.compile(r"\d{1,3}")
 _STEMMER = RussianStemmer()
 
 
@@ -32,47 +26,82 @@ def _stem(word: str) -> str:
 
 
 def _tokens(text: str) -> tuple[str, ...]:
-    return tuple(_stem(word) for word in _WORDS.findall(text.casefold().replace("ё", "е")))
+    text = unicodedata.normalize("NFKC", text).casefold().replace("ё", "е")
+    text = _VOLUME.sub(" ", _FOR.sub("для ", text))
+
+    def normalize(word: str) -> str:
+        if word.endswith("%"):
+            # «0 %», «0,0%» и «0.00 %» — одно значение, но «0,5%» не ноль.
+            whole, _, fraction = word[:-1].strip().replace(",", ".").partition(".")
+            whole = whole.lstrip("0") or "0"
+            fraction = fraction.rstrip("0")
+            return f"{whole}.{fraction}%" if fraction else f"{whole}%"
+        return _stem(word)
+
+    return tuple(normalize(word) for word in _WORDS.findall(text))
 
 
-def _description_terms(description: str) -> Iterable[str]:
-    # Без точного исходника нельзя додумывать синонимы или толковать исключения.
-    # Составное описание с оговоркой требует проверенного ручного правила.
-    if _LIMITS.search(description.replace("ё", "е")) or "(" in description or "[" in description:
-        return
-    for phrase in re.split(r"[,;]", description):
-        phrase = phrase.strip(" .:-—–")
-        if len(phrase) >= 3 and _tokens(phrase) not in _GENERIC_TOKENS:
-            yield phrase
+@dataclass(frozen=True)
+class Phrase:
+    words: tuple[str, ...]
+    at_start: bool
+
+    def matches_at(self, words: tuple[str, ...], index: int, start: int) -> bool:
+        return (not self.at_start or index in (0, start)) and words[index : index + len(self.words)] == self.words
+
+    def occurs(self, words: tuple[str, ...], start: int) -> bool:
+        if self.at_start:
+            return self.matches_at(words, 0, start) or self.matches_at(words, start, start)
+        return any(self.matches_at(words, index, start) for index, word in enumerate(words) if word == self.words[0])
 
 
-_GENERIC_TOKENS = {_tokens(term) for term in _GENERIC}
+@dataclass(frozen=True)
+class Rule:
+    first: Phrase
+    additional: tuple[Phrase, ...]
+    group: int
+    excludes: bool
+
+
+def _rule(line: str, group: int) -> Rule | None:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    excludes = line.startswith("!")
+    if excludes:
+        line = line[1:].lstrip()
+    phrases = []
+    for part in _AND.split(line):
+        part = part.strip()
+        at_start = part.startswith("^")
+        words = _tokens(part[1:] if at_start else part)
+        if not words:
+            return None
+        phrases.append(Phrase(words, at_start))
+    return Rule(phrases[0], tuple(phrases[1:]), group, excludes)
 
 
 class Classifier:
     def __init__(self, catalog: Catalog) -> None:
-        entries: dict[str, set[tuple[tuple[str, ...], int]]] = defaultdict(set)
+        by_word: dict[str, set[Rule]] = defaultdict(set)
+        for group in GROUPS:
+            for line in catalog.recognition_phrases(group):
+                if rule := _rule(line, group):
+                    by_word[rule.first.words[0]].add(rule)
+        self._by_word = dict(by_word)
 
-        def add(number: int, phrases: Iterable[str]) -> None:
-            for phrase in phrases:
-                tokens = _tokens(phrase)
-                if tokens:
-                    entries[tokens[0]].add((tokens, number))
-
-        self._official = {number for number in PDF_GROUPS if catalog.is_official_group(number)}
-        for number in PDF_GROUPS:
-            if number not in self._official:
-                add(number, _description_terms(catalog.points.get(number, "")))
-        add(HOSIERY, _HOSIERY_TERMS)
-        for number in GROUPS:
-            add(number, catalog.rules.get(number, ()))
-        self._by_start = dict(entries)
-
-    def group_for(self, name: str, nomenclature_group: str = "") -> int | None:
-        matches = groups_for_4_torg(name, nomenclature_group) & self._official if self._official else set()
-        tokens = _tokens(name)
-        for index, token in enumerate(tokens):
-            for phrase, number in self._by_start.get(token, ()):
-                if tokens[index : index + len(phrase)] == phrase:
-                    matches.add(number)
+    def group_for(self, name: str) -> int | None:
+        words = _tokens(name)
+        # «1 Колено PPR …»: разрешаем числовой префикс перед началом названия.
+        start = 1 if words and _CODE.fullmatch(words[0]) else 0
+        matches: set[int] = set()
+        blocked: set[int] = set()
+        for index, word in enumerate(words):
+            for rule in self._by_word.get(word, ()):
+                marked = blocked if rule.excludes else matches
+                if rule.group not in marked and rule.first.matches_at(words, index, start) and all(
+                    part.occurs(words, start) for part in rule.additional
+                ):
+                    marked.add(rule.group)
+        matches.difference_update(blocked)
         return matches.pop() if len(matches) == 1 else None

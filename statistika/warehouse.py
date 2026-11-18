@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import re
+from calendar import monthrange
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 
 from openpyxl.utils.cell import get_column_letter
 
-from statistika.statement import ImportedProducts, Product, Sheet, StatementError, cell_at, parse_number
+from statistika.statement import (
+    ImportedProducts, Product, ReportPeriod, Sheet, SourcePeriod, StatementError, cell_at, find_source_period,
+    normalize_unit, parse_number,
+)
 
 
 class SalesQuantity(str, Enum):
@@ -26,54 +30,97 @@ def _header(value: object) -> str:
     return _text(value).casefold().replace("ё", "е")
 
 
-_MONTH = re.compile(
-    r"^(?:январь|февраль|март|апрель|май|июнь|июль|август|сентябрь|октябрь|ноябрь|декабрь)\s+20\d\d(?:\s*г\.?)?$"
+_MONTH_NAMES = (
+    "январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
 )
-_PERIOD = re.compile(r"^с\s+\d{1,2}\.\d{1,2}\.\d{2,4}\s+по\s+\d{1,2}\.\d{1,2}\.\d{2,4}$", re.I)
+_MONTH = re.compile(rf"^({'|'.join(_MONTH_NAMES)})\s+(20\d\d)(?:\s*г\.?)?$")
 _TOTAL = re.compile(r"^(?:итог[ои]?|общий итог|всего)\b", re.I)
-_REQUIRED = ("склад", "группа номенклатуры", "номенклатура", "начальный остаток", "приход", "расход", "конечный остаток", "розничная цена")
+_REQUIRED = ("склад", "номенклатура", "начальный остаток", "приход", "расход", "конечный остаток", "розничная цена")
+
+
+@dataclass(frozen=True)
+class MonthColumn:
+    year: int
+    month: int
+    column: int  # с 0
+
+    @property
+    def label(self) -> str:
+        return f"{_MONTH_NAMES[self.month - 1].capitalize()} {self.year}"
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return self.year, self.month
+
+
+def _column_span(months: tuple[MonthColumn, ...]) -> str:
+    indexes = tuple(month.column for month in months)
+    letters = [get_column_letter(index + 1) for index in indexes]
+    if len(letters) > 1 and indexes == tuple(range(indexes[0], indexes[-1] + 1)):
+        return f"{letters[0]}:{letters[-1]}"
+    return ", ".join(letters)
+
+
+def _month_span(months: tuple[MonthColumn, ...], period: SourcePeriod | None) -> str:
+    first, last = months[0], months[-1]
+    total = (last.year - first.year) * 12 + last.month - first.month + 1
+    if len(months) == 1:
+        label = first.label
+    elif total == len(months):
+        label = f"{first.label} — {last.label} ({len(months)} мес.)"
+    else:
+        label = ", ".join(month.label for month in months)  # пропущенные месяцы не включены
+    if period:
+        if first.key == (period.start.year, period.start.month) and period.start.day > 1:
+            label += f" (с {period.start:%d.%m.%Y})"
+        if last.key == (period.end.year, period.end.month) and period.end.day < monthrange(last.year, last.month)[1]:
+            label += f" (по {period.end:%d.%m.%Y})"
+    return label
 
 
 @dataclass(frozen=True)
 class WarehouseLayout:
     header_row: int  # с 1
-    group_column: int  # индексы столбцов с 0
+    warehouse_column: int  # индексы столбцов с 0
     name_column: int
+    unit_column: int | None
     outflow_column: int
     ending_column: int
     price_column: int
-    month_columns: tuple[int, ...] = ()
-    period: str = ""
+    months: tuple[MonthColumn, ...] = ()
+    source_period: SourcePeriod | None = None
 
     @property
     def months_label(self) -> str:
-        if not self.month_columns:
-            return ""
-        columns = [get_column_letter(col + 1) for col in self.month_columns]
-        if len(columns) == 1:
-            return columns[0]
-        if self.month_columns == tuple(range(self.month_columns[0], self.month_columns[-1] + 1)):
-            return f"{columns[0]}:{columns[-1]}"
-        return ", ".join(columns)
+        return _column_span(self.months)
 
 
 def detect_warehouse_layout(sheet: Sheet) -> WarehouseLayout | None:
     """Явный профиль по сигнатуре заголовков, независимо от букв столбцов."""
-    period = ""
     for index, row in enumerate(sheet.rows[:80], start=1):
         texts = tuple(_header(value) for value in row)
-        for text in texts:
-            if _PERIOD.fullmatch(text):
-                period = text.capitalize()
         if not all(texts.count(title) == 1 for title in _REQUIRED):
             continue
-        month_columns = tuple(col for col, name in enumerate(texts) if _MONTH.fullmatch(name))
+        source_period = find_source_period(sheet.rows[: index - 1])
+        months = []
+        for col, title in enumerate(texts):
+            match = _MONTH.fullmatch(title)
+            if match:
+                month = MonthColumn(int(match[2]), _MONTH_NAMES.index(match[1]) + 1, col)
+                if source_period and not (
+                    (source_period.start.year, source_period.start.month) <= month.key
+                    <= (source_period.end.year, source_period.end.month)
+                ):
+                    continue
+                months.append(month)
         # Повторяющиеся заголовки месяцев неоднозначны — не предлагать их суммирование.
-        if len({texts[col].rstrip(".").removesuffix(" г") for col in month_columns}) != len(month_columns):
-            month_columns = ()
+        if len({month.key for month in months}) != len(months):
+            months = []
+        units = [col for col, title in enumerate(texts) if title in {"ед.", "ед", "ед. изм.", "единица измерения"}]
         return WarehouseLayout(
-            index, texts.index("группа номенклатуры"), texts.index("номенклатура"), texts.index("расход"),
-            texts.index("конечный остаток"), texts.index("розничная цена"), month_columns, period,
+            index, texts.index("склад"), texts.index("номенклатура"),
+            units[0] if len(units) == 1 else None, texts.index("расход"), texts.index("конечный остаток"),
+            texts.index("розничная цена"), tuple(sorted(months, key=lambda month: month.key)), source_period,
         )
     return None
 
@@ -97,9 +144,28 @@ def _price(value: object) -> Decimal | None:
     return number if number is not None and number >= 0 else None
 
 
-def import_warehouse_products(sheet: Sheet, layout: WarehouseLayout, source: SalesQuantity) -> ImportedProducts:
-    if source == SalesQuantity.MONTHS and not layout.month_columns:
+def _selection(layout: WarehouseLayout, source: SalesQuantity, month_range: tuple[int, int] | None) -> tuple[MonthColumn, ...]:
+    if source != SalesQuantity.MONTHS:
+        if month_range is not None:
+            raise StatementError("Выбирать месяцы можно только для помесячной реализации. «Расход» дан за весь период ведомости.")
+        return ()
+    if not layout.months:
         raise StatementError("В листе нет однозначных помесячных столбцов.")
+    start, end = month_range if month_range is not None else (0, len(layout.months) - 1)
+    if not 0 <= start <= end < len(layout.months):
+        raise StatementError("Выберите начало и конец реализации: первый месяц должен быть не позже последнего.")
+    return layout.months[start : end + 1]
+
+
+def import_warehouse_products(
+    sheet: Sheet, layout: WarehouseLayout, source: SalesQuantity, month_range: tuple[int, int] | None = None,
+) -> ImportedProducts:
+    months = _selection(layout, source, month_range)
+    source_period = layout.source_period
+    snapshot = source_period.end if source_period else None
+    snapshot_label = f"{snapshot:%d.%m.%Y}" if snapshot else "дата в источнике не указана"
+    # J — один снимок, не история запасов. При раннем конце периода не подставляем поздние остатки.
+    use_stock = not months or (months[-1].key == (snapshot.year, snapshot.month) if snapshot else months == layout.months)
     products: list[Product] = []
     totals = repeats = no_values = unknown_price = 0
     outflow = get_column_letter(layout.outflow_column + 1)
@@ -110,18 +176,15 @@ def import_warehouse_products(sheet: Sheet, layout: WarehouseLayout, source: Sal
         if _TOTAL.match(name) or (not name and any(_TOTAL.match(_text(value)) for value in row)):
             totals += 1
             continue
-        if (
-            _header(name) == "номенклатура"
-            and _header(cell_at(row, layout.ending_column)) == "конечный остаток"
-        ):
+        if _header(name) == "номенклатура" and _header(cell_at(row, layout.ending_column)) == "конечный остаток":
             repeats += 1
             continue
-        ending_qty = _number(row, layout.ending_column, row_number)
+        ending_qty = _number(row, layout.ending_column, row_number) if use_stock else None
         sold_qty: Decimal | None = None
         if source == SalesQuantity.OUTFLOW:
             sold_qty = _number(row, layout.outflow_column, row_number)
-        elif source == SalesQuantity.MONTHS:
-            amounts = [_number(row, col, row_number) for col in layout.month_columns]
+        elif months:
+            amounts = [_number(row, month.column, row_number) for month in months]
             # Не подменять пустой месячный показатель нулём, в т. ч. при частичных данных.
             if all(amount is not None for amount in amounts):
                 sold_qty = sum((amount for amount in amounts if amount is not None), Decimal(0))
@@ -129,7 +192,7 @@ def import_warehouse_products(sheet: Sheet, layout: WarehouseLayout, source: Sal
             if ending_qty is not None or sold_qty is not None:
                 raise StatementError(f"Строка {row_number}: есть показатели, но нет наименования товара.")
             continue
-        if ending_qty is None and sold_qty is None:
+        if ending_qty is None and sold_qty is None and (use_stock or not _text(cell_at(row, layout.ending_column))):
             no_values += 1
             continue
         stock_amount = None
@@ -141,32 +204,40 @@ def import_warehouse_products(sheet: Sheet, layout: WarehouseLayout, source: Sal
                 unknown_price += 1
             else:
                 stock_amount = ending_qty * retail_price
-        products.append(Product(name, sold_qty, None, ending_qty, stock_amount, _text(cell_at(row, layout.group_column))))
+        products.append(Product(
+            name, sold_qty, None, ending_qty, stock_amount,
+            warehouse=_text(cell_at(row, layout.warehouse_column)),
+            unit=normalize_unit(cell_at(row, layout.unit_column)) if layout.unit_column is not None else "",
+        ))
     if not products:
         raise StatementError("В ведомости ТМЦ нет товарных строк с показателями.")
 
-    quantity_note = {
-        SalesQuantity.UNKNOWN: "Не заполнено: ведомость ТМЦ не содержит поля, явно обозначенного как продажи.",
-        SalesQuantity.MONTHS: f"Сумма помесячных количеств {layout.months_label}, по выбору пользователя. "
-        "Количества считаются продажами только при соответствующей настройке выгрузки. "
-        "Строки с пустыми месяцами не рассчитаны.",
-        SalesQuantity.OUTFLOW: f"Показатель «Расход» ({outflow}), по выбору пользователя. "
-        "Может включать движения, не являющиеся продажами.",
-    }[source]
-    sales_source = {
-        SalesQuantity.UNKNOWN: "не заполнено",
-        SalesQuantity.MONTHS: f"из месяцев {layout.months_label} (выбор пользователя)",
-        SalesQuantity.OUTFLOW: f"из «Расхода» ({outflow}, выбор пользователя)",
-    }[source]
-    summary = (
-        f"Количество продаж: {sales_source}. Суммы продаж в источнике нет. "
-        f"Остаток в розничных ценах ({stock} × {price}): без цены или с неоднозначной ценой — {unknown_price} строк."
+    if source == SalesQuantity.UNKNOWN:
+        quantity_note = "Не заполнено: в ведомости нет поля, явно обозначенного как продажи, и источник не выбран."
+        sales_label = "источник не выбран"
+    elif source == SalesQuantity.MONTHS:
+        quantity_note = (
+            f"Сумма количеств из {_column_span(months)} за выбранные месяцы: {', '.join(month.label for month in months)}. "
+            "Используется по выбору пользователя; строки с пустыми месяцами не рассчитаны."
+        )
+        sales_label = _month_span(months, source_period)
+    else:
+        quantity_note = f"«Расход» ({outflow}) за весь период ведомости. Выбран пользователем; может включать не только продажи."
+        sales_label = f"{source_period.label} («Расход»)" if source_period else "весь период ведомости («Расход»)"
+
+    if use_stock:
+        stock_label = snapshot_label
+        stock_quantity_note = f"Конечный остаток ({stock}): {snapshot_label}."
+        stock_amount_note = f"Конечное количество ({stock}) × розничная цена ({price}). Без одной числовой цены сумма не рассчитана."
+        summary = f"Суммы продаж в источнике нет. Остаток ({stock} × {price}): без цены или с неоднозначной ценой — {unknown_price} строк."
+    else:
+        stock_label = "нет на конец выбранного периода"
+        stock_quantity_note = stock_amount_note = f"Не рассчитано: ведомость содержит только снимок остатков ({snapshot_label})."
+        summary = f"Суммы продаж в источнике нет. Остатки не подставлены: ведомость содержит только снимок ({snapshot_label})."
+    return ImportedProducts(
+        tuple(products), totals, repeats, no_values, summary,
+        ((3, quantity_note),
+         (4, "Колонки фактической суммы продаж нет. Текущая розничная цена не заменяет цены отдельных продаж."),
+         (5, stock_quantity_note), (6, stock_amount_note)),
+        ReportPeriod(sales_label, tuple(month.label for month in months), stock_label),
     )
-    notes = (
-        (3, quantity_note),
-        (4, "Колонки фактической суммы продаж нет. Текущая розничная цена не заменяет цены отдельных продаж."),
-        (5, f"Конечный остаток по ведомости, столбец {stock}." + (f" Период: {layout.period}." if layout.period else "")),
-        (6, f"Конечное количество ({stock}) × розничная цена из ведомости ({price}). "
-            "Если ненулевой остаток не имеет одной числовой цены, сумма не заполнена."),
-    )
-    return ImportedProducts(tuple(products), totals, repeats, no_values, summary, notes)

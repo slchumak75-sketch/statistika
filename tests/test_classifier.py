@@ -11,7 +11,7 @@ def test_hosiery_builtin_group(name):
 
 def test_catalog_words_and_user_rules():
     # Учебные описания, не значения из документа заказчика.
-    catalog = Catalog({35: "Кофе молотый; кофейные напитки", 36: "Чай", 44: "Мыло"}, {36: ("сенча",)})
+    catalog = Catalog({35: "Кофе молотый; кофейные напитки", 36: "Чай", 44: "Мыло"}, {36: ("чай", "сенча")})
     classifier = Classifier(catalog)
     assert classifier.group_for("Кофе молотого 250 г") == 35
     assert classifier.group_for("кофейного напитка 200 мл") == 35
@@ -31,3 +31,14 @@ def test_exclusions_and_generic_definitions_are_not_automatically_guessed():
     assert classifier.group_for("Сахар белый") is None
     assert classifier.group_for("МЕД цветочный") == 38
     assert Classifier(Catalog(original, {35: ("кофе зерновой",)})).group_for("кофе зерновой") == 35
+
+
+def test_phrase_markers_are_editable_literal_conditions():
+    catalog = Catalog(rules={53: ("# Сверло не входит в описание этой строки", "^шпатель + фасадный", "!для депиляции", "^сверло SDS+")})
+    classifier = Classifier(catalog)
+    assert classifier.group_for("1 Шпатель 100 мм фасадный") == 53
+    assert classifier.group_for("Набор: шпатель фасадный") is None
+    assert classifier.group_for("Шпатель фасадный для депиляции") is None
+    assert classifier.group_for("Шпатель 100 мм") is None
+    assert classifier.group_for("Сверло SDS+ GEPARD") == 53
+    assert classifier.group_for("Сверло не входит в описание этой строки") is None

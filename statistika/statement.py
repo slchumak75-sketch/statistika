@@ -9,10 +9,12 @@ import re
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from functools import cached_property
 from itertools import islice
 from pathlib import Path
+from typing import Iterable
 from zipfile import BadZipFile
 
 import xlrd
@@ -56,11 +58,29 @@ class Product:
     sold_amount: Decimal | None
     ending_quantity: Decimal | None
     ending_amount: Decimal | None
-    nomenclature_group: str = ""
+    warehouse: str = ""
+    unit: str = ""
 
     @property
     def metrics(self) -> tuple[Decimal | None, ...]:
         return (self.sold_quantity, self.sold_amount, self.ending_quantity, self.ending_amount)
+
+
+@dataclass(frozen=True)
+class SourcePeriod:
+    start: date
+    end: date
+
+    @property
+    def label(self) -> str:
+        return f"{self.start:%d.%m.%Y} — {self.end:%d.%m.%Y}"
+
+
+@dataclass(frozen=True)
+class ReportPeriod:
+    sales_label: str = ""
+    sales_months: tuple[str, ...] = ()
+    stock_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -71,6 +91,35 @@ class ImportedProducts:
     skipped_no_values: int = 0
     summary: str = ""
     column_notes: tuple[tuple[int, str], ...] = ()  # Номера столбцов результата с 1.
+    period: ReportPeriod = ReportPeriod()
+
+
+_PERIOD = re.compile(r"^(?:период:?\s*)?с\s+(\d{1,2}\.\d{1,2}\.(?:\d{4}|\d{2}))\s+по\s+(\d{1,2}\.\d{1,2}\.(?:\d{4}|\d{2}))$", re.I)
+
+
+def find_source_period(rows: Iterable[tuple[object, ...]]) -> SourcePeriod | None:
+    def from_string(value: str) -> date:
+        day, month, year = map(int, value.split("."))
+        return date(year + 2000 if year < 100 else year, month, day)
+
+    for row in rows:
+        for value in row:
+            if isinstance(value, str) and (match := _PERIOD.fullmatch(" ".join(value.split()))):
+                try:
+                    start, end = map(from_string, match.groups())
+                except ValueError:
+                    continue
+                if start <= end:
+                    return SourcePeriod(start, end)
+    return None
+
+
+def normalize_unit(value: object) -> str:
+    unit = _heading(value).casefold()
+    piece = {"шт", "шт.", "штука", "штук", "штуки"}
+    if unit in piece:
+        return "шт."
+    return {"м2": "м²", "пог.м.": "пог. м", "упак": "упак."}.get(unit, unit)
 
 
 def list_sheets(path: Path) -> tuple[str, ...]:
@@ -317,7 +366,13 @@ def parse_number(value: object) -> Decimal | None:
 
 def import_products(sheet: Sheet, plan: ImportPlan) -> ImportedProducts:
     labels = column_headers(sheet, plan.first_header, plan.last_header)
-    group_cols = [col for col, label in enumerate(labels) if _words(label) == ("группа", "номенклатуры")]
+
+    def auxiliary_column(*aliases: tuple[str, ...]) -> int | None:
+        cols = [col for col, label in enumerate(labels) if _words(label) in aliases]
+        return cols[0] if len(cols) == 1 else None
+
+    warehouse_col = auxiliary_column(("склад",), ("наименование", "склада"))
+    unit_col = auxiliary_column(("ед",), ("ед", "изм"), ("единица", "измерения"), ("единица",))
     if len(plan.columns) != len(SOURCE_COLUMNS) or any(
         col is None or not 0 <= col < sheet.width for col in plan.columns
     ):
@@ -325,6 +380,9 @@ def import_products(sheet: Sheet, plan: ImportPlan) -> ImportedProducts:
     columns = tuple(col for col in plan.columns if col is not None)
     if len(set(columns)) != len(columns):
         raise StatementError("Для каждого поля нужен отдельный столбец ведомости.")
+    # Без отдельной единицы считаем количества штуками только при явной помете в обоих заголовках.
+    quantity_cols = (columns[1], columns[3])
+    default_unit = "шт." if all({"шт", "штук", "штуки"}.intersection(_words(labels[col])) for col in quantity_cols) else ""
 
     def selected(row: tuple[object, ...]) -> tuple[object, ...]:
         return tuple(cell_at(row, col) for col in columns)
@@ -363,8 +421,13 @@ def import_products(sheet: Sheet, plan: ImportPlan) -> ImportedProducts:
             except ValueError as error:
                 letter = get_column_letter(col + 1)
                 raise StatementError(f"Строка {number}, столбец {letter} («{label}»): не число — {value!r}.") from error
-        group = _heading(cell_at(row, group_cols[0])) if len(group_cols) == 1 else ""
-        products.append(Product(name, *values, nomenclature_group=group))
+        products.append(Product(
+            name, *values,
+            warehouse=_heading(cell_at(row, warehouse_col)) if warehouse_col is not None else "",
+            unit=normalize_unit(cell_at(row, unit_col)) if unit_col is not None else default_unit,
+        ))
     if not products:
         raise StatementError("Не найдено товарных строк. Проверьте лист, границы заголовка и выбранные столбцы.")
-    return ImportedProducts(tuple(products), totals, repeated, no_values)
+    source_period = find_source_period(sheet.rows[: plan.last_header])
+    period = ReportPeriod(sales_label=source_period.label, stock_label=f"{source_period.end:%d.%m.%Y}") if source_period else ReportPeriod()
+    return ImportedProducts(tuple(products), totals, repeated, no_values, period=period)

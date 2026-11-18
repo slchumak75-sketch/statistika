@@ -113,3 +113,16 @@ def test_mapping_rejects_bad_amount_and_missing_name():
         import_products(Sheet((("A", 1, 58, 2, 100),)), ImportPlan(0, 0, (0, 1, 2, 1, 4)))
     with pytest.raises(StatementError, match="строки заголовка"):
         import_products(Sheet((("A", 1, 58, 2, 100),)), ImportPlan(0, 1, plan.columns))
+
+
+def test_generic_import_keeps_explicit_warehouse_unit_and_period():
+    data = Sheet((
+        ("С 01.03.26 по 31.03.26",),
+        ("Склад", "Ед. изм.", "Номенклатура", *SOURCE_COLUMNS[1:]),
+        ("Склад A", "м2", "Товар", 2, 3, 4, 5),
+        ("Склад B", "шт", "Товар", 2, 3, 4, 5),
+    ))
+    result = import_products(data, ImportPlan(2, 2, (2, 3, 4, 5, 6)))
+    assert [(p.warehouse, p.unit) for p in result.products] == [("Склад A", "м²"), ("Склад B", "шт.")]
+    assert result.period.sales_label == "01.03.2026 — 31.03.2026"
+    assert result.period.stock_label == "31.03.2026"

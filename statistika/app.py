@@ -29,20 +29,17 @@ _MUTED = "#466078"
 _BLUE = "#174f91"
 _APP_TITLE = "Статистика — продажи и остатки"
 _VOLUME_COLUMNS = ("volume", "sold_volume", "stock_volume")
+_VOLUME_TOTAL_HEADERS = ("Продано дал.", "Остаток дал.")
+_SOLD_QUANTITY_HEADER = "Продано, шт."
 _ALL_ROWS, _ASSIGNED_ROWS, _UNASSIGNED_ROWS = "all", "assigned", "unassigned"
 _GROUP_FILTER_PRESETS = {
     _ALL_ROWS: "Все строки", _ASSIGNED_ROWS: "Только с группой", _UNASSIGNED_ROWS: "Только без группы",
 }
 _SALES_LABELS = {
-    SalesQuantity.MONTHS: "По месяцам",
+    SalesQuantity.MONTHS: "За выбранные месяцы",
     SalesQuantity.UNKNOWN: "Не заполнять",
     SalesQuantity.OUTFLOW: "Расход за весь период",
 }
-
-
-def _volume_text(value: Decimal | None) -> str:
-    text = display_number(value)
-    return text.rstrip("0").rstrip(",") if "," in text else text
 
 
 def _sales_options(layout: WarehouseLayout) -> tuple[SalesQuantity, ...]:
@@ -83,6 +80,7 @@ class MainWindow:
         self.month_range: tuple[int, int] | None = None
         self.warehouse_options: tuple[str | None, ...] = (None,)
         self.group_filter = tk.StringVar(value=_ALL_ROWS)
+        self.sales_choice = tk.StringVar(value=SalesQuantity.UNKNOWN.value)
         self.stats_text = tk.StringVar(value="Строк: 0")
         self.source_name = ""
 
@@ -102,20 +100,22 @@ class MainWindow:
         body = ttk.Frame(self.root, padding=(8, 6))
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
-        body.rowconfigure(2, weight=1)
+        body.rowconfigure(1, weight=1)
 
         toolbar = ttk.Frame(body)
         toolbar.grid(row=0, sticky="ew", pady=(0, 4))
-        ttk.Button(toolbar, text="Открыть ведомость…", style="Toolbar.Accent.TButton", command=self.open_statement).pack(side="left")
-        self.export_button = ttk.Button(toolbar, text="Сохранить Excel…", style="Toolbar.TButton", command=self.save_report)
+        toolbar.columnconfigure(2, weight=1)
+        actions = ttk.Frame(toolbar)
+        actions.grid(row=0, column=0, sticky="w")
+        ttk.Button(actions, text="Открыть ведомость…", style="Toolbar.Accent.TButton", command=self.open_statement).pack(side="left")
+        self.export_button = ttk.Button(actions, text="Сохранить Excel…", style="Toolbar.TButton", command=self.save_report)
         self.export_button.pack(side="left", padx=4)
-        self.edit_button = ttk.Button(toolbar, text="Изменить группу…", style="Toolbar.TButton", command=self.edit_selected)
-        self.edit_button.pack(side="left")
-        ttk.Button(toolbar, text="Справочник групп…", style="Toolbar.TButton", command=self.edit_catalog).pack(side="left", padx=4)
-        ttk.Label(toolbar, textvariable=self.stats_text, style="Muted.TLabel").pack(side="right", padx=(4, 0))
+        ttk.Button(actions, text="Справочник групп…", style="Toolbar.TButton", command=self.edit_catalog).pack(side="left")
+        stats = ttk.Label(toolbar, textvariable=self.stats_text, style="Muted.TLabel")
+        stats.grid(row=0, column=2, sticky="e", padx=(8, 0))
 
-        filters = self.filters = ttk.Frame(body)
-        filters.grid(row=1, sticky="ew", pady=(0, 4))
+        filters = self.filters = ttk.Frame(toolbar)
+        filters.grid(row=0, column=1, sticky="w", padx=(10, 0))
         self.warehouse_fields = ttk.Frame(filters)
         self.warehouse_fields.grid(row=0, column=0, sticky="w")
         ttk.Label(self.warehouse_fields, text="Склад").pack(side="left")
@@ -126,63 +126,60 @@ class MainWindow:
 
         self.period_fields = ttk.Frame(filters)
         self.period_fields.grid(row=0, column=1, sticky="w")
-        ttk.Label(self.period_fields, text="Количество").pack(side="left")
-        self.sales_selector = ttk.Combobox(self.period_fields, state="readonly", width=21)
-        self.sales_selector.pack(side="left", padx=(4, 10))
-        self.month_fields = ttk.Frame(self.period_fields)
-        ttk.Label(self.month_fields, text="Период с").pack(side="left")
-        self.first_month = ttk.Combobox(self.month_fields, state="readonly", width=14)
+        ttk.Label(self.period_fields, text="Период с").pack(side="left")
+        self.first_month = ttk.Combobox(self.period_fields, state="readonly", width=14)
         self.first_month.pack(side="left", padx=4)
-        ttk.Label(self.month_fields, text="по").pack(side="left")
-        self.last_month = ttk.Combobox(self.month_fields, state="readonly", width=14)
-        self.last_month.pack(side="left", padx=4)
-        for combo in (self.sales_selector, self.first_month, self.last_month):
+        ttk.Label(self.period_fields, text="по").pack(side="left")
+        self.last_month = ttk.Combobox(self.period_fields, state="readonly", width=14)
+        self.last_month.pack(side="left", padx=(4, 0))
+        for combo in (self.first_month, self.last_month):
             combo.bind("<<ComboboxSelected>>", self.change_period)
         self.period_fields.grid_remove()
-        self.filters.grid_remove()
+        filters.grid_remove()
 
-        def fit_filters(_event=None) -> None:
-            if not self.period_fields.winfo_manager():
+        def fit_toolbar(_event=None) -> None:
+            if not filters.winfo_manager():
                 return
-            warehouse_width = self.warehouse_fields.winfo_reqwidth() if self.warehouse_fields.winfo_manager() else 0
-            wrap = warehouse_width > 0 and warehouse_width + self.period_fields.winfo_reqwidth() > filters.winfo_width()
-            row = int(wrap)
-            if int(self.period_fields.grid_info()["row"]) != row:
-                self.period_fields.grid(row=row, column=0 if wrap else 1, columnspan=2 if wrap else 1, pady=(3, 0) if wrap else 0)
+            width_needed = actions.winfo_reqwidth() + filters.winfo_reqwidth() + stats.winfo_reqwidth() + 18
+            row = int(width_needed > toolbar.winfo_width())
+            if int(filters.grid_info()["row"]) != row:
+                filters.grid(row=row, column=0 if row else 1, columnspan=3 if row else 1,
+                             padx=0 if row else (10, 0), pady=(4, 0) if row else 0)
 
-        filters.bind("<Configure>", fit_filters)
-        self.period_fields.bind("<Configure>", fit_filters)
+        for widget in (toolbar, filters, stats):
+            widget.bind("<Configure>", fit_toolbar)
 
         self.tabs = ttk.Notebook(body)
-        self.tabs.grid(row=2, sticky="nsew")
+        self.tabs.grid(row=1, sticky="nsew")
         table = self.detail_tab = ttk.Frame(self.tabs)
         self.summary_tab = ttk.Frame(self.tabs)
         self.tabs.add(table, text="Товары")
         self.tabs.add(self.summary_tab, text="Сводка по группам")
-        self.tabs.bind("<<NotebookTabChanged>>", self.refresh_selection)
+        self.tabs.bind("<<NotebookTabChanged>>", lambda _event: self.dismiss_cell_controls())
         table.columnconfigure(0, weight=1)
         table.rowconfigure(0, weight=1)
         columns = (
             ("group", RESULT_COLUMNS[0], 195, 150),
             ("name", RESULT_COLUMNS[1], 250, 170),
             ("volume", "Объём тары, л", 108, 108),
-            ("sold_qty", "Продано, шт.", 102, 102),
+            ("sold_qty", _SOLD_QUANTITY_HEADER, 102, 102),
             ("sold_amount", "Продано, руб.", 104, 104),
             ("stock_qty", "Остаток, шт.", 102, 102),
             ("stock_amount", "Остаток, руб.", 104, 104),
-            ("sold_volume", "Продано дал.", 102, 102),
-            ("stock_volume", "Остаток дал.", 102, 102),
+            ("sold_volume", _VOLUME_TOTAL_HEADERS[0], 102, 102),
+            ("stock_volume", _VOLUME_TOTAL_HEADERS[1], 102, 102),
         )
         self.tree = ttk.Treeview(table, columns=[col[0] for col in columns], show="headings", selectmode="browse")
         self.tree.grid(row=0, column=0, sticky="nsew")
         heading_font = font.nametofont("TkDefaultFont", root=self.root)
         for index, (name, title, width, minwidth) in enumerate(columns):
-            label = f"{title} ▾" if name == "group" else title
+            label = f"{title} ▾" if name in ("group", "sold_qty") else title
             minwidth = max(minwidth, heading_font.measure(label) + 14)
             self.tree.heading(name, text=title, anchor="w" if index < 2 else "center")
             self.tree.column(name, width=max(width, minwidth), minwidth=minwidth,
                              anchor="w" if index < 2 else "e", stretch=index < 2)
         self.group_menu = tk.Menu(self.tree, tearoff=False)
+        self.sales_menu = tk.Menu(self.tree, tearoff=False)
         self.tree.heading("group", command=self.open_group_filter)
         sy = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         sx = ttk.Scrollbar(table, orient="horizontal", command=self.tree.xview)
@@ -199,7 +196,6 @@ class MainWindow:
         self.tree.configure(yscrollcommand=lambda a, b: update_scrollbar(sy, a, b),
                             xscrollcommand=lambda a, b: update_scrollbar(sx, a, b))
         self.tree.tag_configure("odd", background="#f1f6fc")
-        self.tree.bind("<<TreeviewSelect>>", self.refresh_selection)
         self.tree.bind("<Return>", self.edit_selected)
         self.tree.bind("<ButtonRelease-1>", self._click_cell)
         self.tree.bind("<Double-Button-1>", self._open_cell_entry)
@@ -210,12 +206,16 @@ class MainWindow:
         tab = self.summary_tab
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=1)
-        columns = ("group", "lines", "sold_qty", "sold_amount", "stock_qty", "stock_amount")
+        columns = ("group", "lines", "sold_qty", "sold_amount", "stock_qty", "stock_amount", *_VOLUME_COLUMNS[1:])
         self.summary_tree = ttk.Treeview(tab, columns=columns, show="headings", selectmode="browse")
         self.summary_tree.grid(row=0, column=0, sticky="nsew")
-        headers = ("Группа", "Строк", *SUMMARY_COLUMNS[2:])
-        for index, (column, label, width) in enumerate(zip(columns, headers, (276, 63, 120, 120, 120, 120))):
-            self.summary_tree.column(column, width=width, minwidth=min(width, 175), anchor="w" if not index else "e", stretch=not index)
+        headers = ("Группа", "Строк", *SUMMARY_COLUMNS[2:], *_VOLUME_TOTAL_HEADERS)
+        widths = (250, 63, 102, 104, 102, 104, 102, 102)
+        heading_font = font.nametofont("TkDefaultFont", root=self.root)
+        for index, (column, label, width) in enumerate(zip(columns, headers, widths, strict=True)):
+            minwidth = max(min(width, 170), heading_font.measure(label) + 14)
+            self.summary_tree.column(column, width=max(width, minwidth), minwidth=minwidth,
+                                     anchor="w" if not index else "e", stretch=not index)
             self.summary_tree.heading(column, text=label, anchor="w" if not index else "center")
         sy = ttk.Scrollbar(tab, orient="vertical", command=self.summary_tree.yview)
         sx = ttk.Scrollbar(tab, orient="horizontal", command=self.summary_tree.xview)
@@ -237,7 +237,9 @@ class MainWindow:
         for group in summarize_groups(rows) if self.rows else ():
             tree.insert("", "end", iid=str(group.group), values=(
                 self.catalog.short_label(group.group) or "Без группы", group.lines,
-                *(display_total(total) for total in group.metrics),
+                display_total(group.sold_quantity), display_total(group.sold_amount),
+                display_total(group.ending_quantity, trim_zeros=True), display_total(group.ending_amount),
+                display_total(group.sold_volume, trim_zeros=True), display_total(group.ending_volume, trim_zeros=True),
             ))
 
     def edit_catalog(self) -> None:
@@ -316,8 +318,6 @@ class MainWindow:
         self.classify()
         self.unsaved.clear()
         self.group_filter.set(_ALL_ROWS)
-        self.setup_period()
-        self.set_report_metadata(result)
         available = warehouses(self.rows)
         self.warehouse_options = (None, *available)
         self.warehouse_selector.configure(values=(ALL_WAREHOUSES, *available), state="readonly" if available else "disabled")
@@ -326,58 +326,58 @@ class MainWindow:
             self.warehouse_fields.grid()
         else:
             self.warehouse_fields.grid_remove()
-        if available or warehouse_source is not None:
-            self.filters.grid()
-        else:
-            self.filters.grid_remove()
+        self.setup_period()
+        self.set_report_metadata(result)
         self.tabs.select(self.detail_tab)
         self.redraw()
 
     def setup_period(self) -> None:
-        if self.warehouse_source is None:
-            self.period_fields.grid_remove()
-            self.sales_options = ()
-            self.month_range = None
-            return
-        _, layout = self.warehouse_source
-        self.sales_options = _sales_options(layout)
-        self.sales_selector.configure(values=tuple(_SALES_LABELS[source] for source in self.sales_options))
-        self.applied_source = self.sales_options[0]
-        labels = tuple(month.label for month in layout.months)
+        layout = self.warehouse_source[1] if self.warehouse_source is not None else None
+        self.sales_options = _sales_options(layout) if layout is not None else ()
+        self.applied_source = self.sales_options[0] if self.sales_options else SalesQuantity.UNKNOWN
+        labels = tuple(month.label for month in layout.months) if layout is not None else ()
         self.month_range = (0, len(labels) - 1) if labels else None
         for combo in (self.first_month, self.last_month):
             combo.configure(values=labels)
             combo.set("")
+        self.tree.heading(
+            "sold_qty", text=f"{_SOLD_QUANTITY_HEADER} ▾" if self.sales_options else _SOLD_QUANTITY_HEADER,
+            command=self.open_sales_menu if self.sales_options else "",
+        )
         self.sync_period_fields()
-        self.period_fields.grid()
 
     def sync_period_fields(self) -> None:
-        self.sales_selector.current(self.sales_options.index(self.applied_source))
         if self.month_range is not None:
             self.first_month.current(self.month_range[0])
             self.last_month.current(self.month_range[1])
-        if self.applied_source == SalesQuantity.MONTHS:
-            self.month_fields.pack(side="left")
+        show_months = self.applied_source == SalesQuantity.MONTHS
+        if show_months:
+            self.period_fields.grid()
         else:
-            self.month_fields.pack_forget()
+            self.period_fields.grid_remove()
+        if self.warehouse_fields.winfo_manager() or show_months:
+            self.filters.grid()
+        else:
+            self.filters.grid_remove()
 
     def change_period(self, event=None) -> None:
-        if self.warehouse_source is None:
+        if self.applied_source != SalesQuantity.MONTHS:
             return
-        sheet, layout = self.warehouse_source
-        source = self.sales_options[self.sales_selector.current()]
-        new_range = self.month_range
-        if source == SalesQuantity.MONTHS:
-            first, last = self.first_month.current(), self.last_month.current()
-            if first > last:  # Редактируемая граница всегда имеет приоритет.
-                if event is not None and event.widget is self.last_month:
-                    first = last
-                else:
-                    last = first
-            new_range = first, last
+        first, last = self.first_month.current(), self.last_month.current()
+        if first > last:  # Редактируемая граница всегда имеет приоритет.
+            if event is not None and event.widget is self.last_month:
+                first = last
+            else:
+                last = first
+        self.apply_period(SalesQuantity.MONTHS, (first, last))
+
+    def apply_period(self, source: SalesQuantity, new_range: tuple[int, int] | None) -> None:
+        if self.warehouse_source is None or source not in self.sales_options:
+            return
         if (source, new_range) == (self.applied_source, self.month_range):
             self.sync_period_fields()
             return
+        sheet, layout = self.warehouse_source
         self.root.configure(cursor="watch")
         self.root.update_idletasks()
         try:
@@ -398,15 +398,17 @@ class MainWindow:
     def set_report_metadata(self, result: ImportedProducts) -> None:
         self.period = result.period
         self.column_notes = result.column_notes
+        source = ""
+        if self.warehouse_source is not None and self.applied_source != SalesQuantity.MONTHS:
+            source = " · Продажи не заполняются" if self.applied_source == SalesQuantity.UNKNOWN else " · Расход за весь период"
         stock = f" · Остатки: {self.period.stock_label}" if self.period.stock_label else ""
-        self.root.title(f"{_APP_TITLE} — {self.source_name}{stock}")
+        self.root.title(f"{_APP_TITLE} — {self.source_name}{source}{stock}")
 
     def dismiss_cell_controls(self) -> None:
         self.picker.dismiss()
         self.cell_entry.dismiss()
 
     def open_group_filter(self) -> None:
-        self.dismiss_cell_controls()
         menu = self.group_menu
         menu.delete(0, "end")
         for value, label in _GROUP_FILTER_PRESETS.items():
@@ -416,6 +418,21 @@ class MainWindow:
             label = self.catalog.short_label(number)
             menu.add_radiobutton(label=label if len(label) <= 72 else label[:71] + "…",
                                  variable=self.group_filter, value=str(number), command=self.redraw)
+        self.popup_table_menu(menu)
+
+    def open_sales_menu(self) -> None:
+        if not self.sales_options:
+            return
+        menu = self.sales_menu
+        menu.delete(0, "end")
+        self.sales_choice.set(self.applied_source.value)
+        for source in self.sales_options:
+            menu.add_radiobutton(label=_SALES_LABELS[source], variable=self.sales_choice, value=source.value,
+                                 command=lambda mode=source: self.apply_period(mode, self.month_range))
+        self.popup_table_menu(menu)
+
+    def popup_table_menu(self, menu: tk.Menu) -> None:
+        self.dismiss_cell_controls()
         try:
             menu.tk_popup(*self.tree.winfo_pointerxy())
         finally:
@@ -449,10 +466,10 @@ class MainWindow:
                 continue
             liters, sold_volume, stock_volume = row.volume_values
             self.tree.insert("", "end", iid=str(index), values=(
-                self.catalog.short_label(row.group), row.product.name, _volume_text(liters),
+                self.catalog.short_label(row.group), row.product.name, display_number(liters, trim_zeros=True),
                 display_quantity(row.product.sold_quantity, row.product.unit), display_number(row.product.sold_amount),
-                display_quantity(row.product.ending_quantity, row.product.unit), display_number(row.product.ending_amount),
-                _volume_text(sold_volume), _volume_text(stock_volume),
+                display_quantity(row.product.ending_quantity, row.product.unit, trim_zeros=True), display_number(row.product.ending_amount),
+                display_number(sold_volume, trim_zeros=True), display_number(stock_volume, trim_zeros=True),
             ), tags=("odd",) if visible % 2 else ())
             visible += 1
         if keep_position:
@@ -464,7 +481,6 @@ class MainWindow:
         selected_rows = self.warehouse_rows()
         self.refresh_counters(selected_rows)
         self.refresh_summary(selected_rows)
-        self.refresh_selection()
 
     def refresh_counters(self, rows: list[ReportRow]) -> None:
         unassigned = sum(row.group is None for row in rows)
@@ -480,12 +496,6 @@ class MainWindow:
     def selected_index(self) -> int | None:
         selection = self.tree.selection()
         return int(selection[0]) if selection else None
-
-    def refresh_selection(self, _event=None) -> None:
-        showing_detail = self.tabs.select() == str(self.detail_tab)
-        if not showing_detail:
-            self.dismiss_cell_controls()
-        self.edit_button.state(["!disabled" if showing_detail and self.selected_index() is not None else "disabled"])
 
     def _open_cell_entry(self, event) -> str | None:
         if self.tree.identify_region(event.x, event.y) != "cell":
@@ -505,7 +515,7 @@ class MainWindow:
 
     def update_volume_cells(self, item: str) -> None:
         for column, value in zip(_VOLUME_COLUMNS, self.rows[int(item)].volume_values, strict=True):
-            self.tree.set(item, column, _volume_text(value))
+            self.tree.set(item, column, display_number(value, trim_zeros=True))
 
     def apply_volume(self, item: str, text: str) -> bool:
         try:
@@ -515,6 +525,7 @@ class MainWindow:
             return False
         self.rows[int(item)].manual_volume = liters
         self.update_volume_cells(item)
+        self.refresh_summary(self.warehouse_rows())
         return True
 
     def _click_cell(self, event) -> None:
@@ -552,7 +563,6 @@ class MainWindow:
         selected_rows = self.warehouse_rows()
         self.refresh_counters(selected_rows)
         self.refresh_summary(selected_rows)
-        self.refresh_selection()
 
     def save_report(self) -> None:
         self.dismiss_cell_controls()
@@ -605,22 +615,36 @@ def _check_volume_cells(app: MainWindow, base: Path) -> Path:
         "С 01.10.26 по 15.11.26\n"
         "Склад;Группа номенклатуры;Номенклатура;Ед.;Начальный остаток;Приход;Расход;"
         "Конечный остаток;Розничная цена;Октябрь 2026 г.;Ноябрь 2026 г.\n"
-        f"Мир;Напитки;{name};шт.;2;5;6;3;4,50;2;4\n"
-        'Мир;Напитки;Водка "Finsky" 0,5;шт.;2;5;3;4;12;1;2\n'
-        "Кореличи;Краски;Краска БТ-177 Бронза 0,5л;шт.;1;2;1;2;7;1;0\n",
+        f"Мир;Напитки;{name};шт.;2;5;6;3,00;4,50;2;4\n"
+        'Мир;Напитки;Пиво "Без маркировки" 0,5;шт.;2;5;3;4,00;12;1;2\n'
+        "Кореличи;Краски;Краска БТ-177 Бронза 0,5л;шт.;1;2;1;2,50;7;1;0\n"
+        'Кореличи;Напитки;Пиво "Светлое" 1л;шт.;2;3;3;2,00;6;1;2\n',
         encoding="utf-8",
     )
     app.open_path(source)
     root.update()
-    assert [row.group for row in app.rows] == [40, 38, 53]
+    assert [row.group for row in app.rows] == [40, 40, 53, 40]
     assert tree["columns"][1:3] == ("name", "volume") and tree["columns"][-2:] == _VOLUME_COLUMNS[1:]
     assert tuple(tree.heading(col, "text") for col in _VOLUME_COLUMNS) == ("Объём тары, л", "Продано дал.", "Остаток дал.")
+    assert tree.set("0", "stock_qty") == "3" and tree.set("2", "stock_qty") == "2,5"
+    summary = app.summary_tree
+    assert summary["columns"][-2:] == _VOLUME_COLUMNS[1:]
+    assert tuple(summary.heading(col, "text") for col in _VOLUME_COLUMNS[1:]) == ("Продано дал.", "Остаток дал.")
 
     def volumes(item: str = "0") -> tuple[str, ...]:
         return tuple(tree.set(item, column) for column in _VOLUME_COLUMNS)
 
+    def group_volumes(group: str) -> tuple[str, ...]:
+        return tuple(summary.set(group, column) for column in _VOLUME_COLUMNS[1:])
+
     assert volumes() == ("0,5", "3", "1,5")
     assert volumes("1") == ("", "", "") and volumes("2") == ("0,5", "", "")
+    assert group_volumes("40") == ("6*", "3,5*") and group_volumes("53") == ("", "")
+    app.tabs.select(app.summary_tab)
+    root.update()
+    assert summary.winfo_ismapped()
+    app.tabs.select(app.detail_tab)
+    root.update()
     timestamps = count(1000, 1000)
 
     def double_click(column: str, item: str = "0") -> None:
@@ -655,6 +679,7 @@ def _check_volume_cells(app: MainWindow, base: Path) -> Path:
 
     enter_volume("750 мл", "<Return>")
     assert entry.item is None and volumes() == ("0,75", "4,5", "2,25")
+    assert group_volumes("40") == ("7,5*", "4,25*")
     enter_volume("1,25", "<Escape>")
     assert entry.item is None and app.rows[0].manual_volume == Decimal("0.75")
     with patch.object(messagebox, "showwarning") as warning:
@@ -663,15 +688,21 @@ def _check_volume_cells(app: MainWindow, base: Path) -> Path:
     assert entry.item == "0" and volumes() == ("0,75", "4,5", "2,25")
     entry.dismiss(focus_tree=True)
     enter_volume("0,5", "<Return>", "1")
-    assert volumes("1") == ("0,5", "1,5", "2")
+    assert volumes("1") == ("0,5", "1,5", "2") and group_volumes("40") == ("9", "6,25")
     enter_volume("", "<Return>", "1")
     assert volumes("1") == ("", "", "") and app.rows[1].manual_volume is None
+    assert group_volumes("40") == ("7,5*", "4,25*")
 
-    app.assign_group("0", 46)
-    assert volumes() == ("0,75", "", "")
-    app.assign_group("0", 45)
-    assert volumes() == ("0,75", "4,5", "2,25")
     app.warehouse_selector.current(app.warehouse_options.index("Мир"))
+    app.group_filter.set("53")
+    app.redraw()
+    assert not tree.get_children() and group_volumes("40") == ("4,5*", "2,25*")
+    app.group_filter.set(_ALL_ROWS)
+    app.redraw()
+    app.assign_group("0", 46)
+    assert volumes() == ("0,75", "", "") and group_volumes("46") == group_volumes("40") == ("", "")
+    app.assign_group("0", 45)
+    assert volumes() == ("0,75", "4,5", "2,25") and group_volumes("45") == ("4,5", "2,25")
     app.group_filter.set("45")
     app.redraw()
     app.last_month.current(0)
@@ -679,7 +710,7 @@ def _check_volume_cells(app: MainWindow, base: Path) -> Path:
     root.update()
     assert app.active_warehouse() == "Мир" and app.group_filter.get() == "45"
     assert tree.get_children() == ("0",) and app.rows[0].manual_volume == Decimal("0.75")
-    assert volumes() == ("0,75", "1,5", "")
+    assert volumes() == ("0,75", "1,5", "") and group_volumes("45") == ("1,5", "")
     return source
 
 
@@ -884,7 +915,17 @@ def _self_test(marker: Path) -> int:
                 assert [row.group for row in app.rows] == [53, 53, 53, 53]
                 assert app.applied_source == SalesQuantity.MONTHS and app.period.sales_months == ("Октябрь 2026", "Ноябрь 2026")
                 assert app.rows[0].product.metrics == (5, 24, 3, Decimal("14.4"))
-                assert app.period_fields.winfo_ismapped() and app.month_fields.winfo_ismapped()
+                assert app.period_fields.winfo_ismapped() and app.warehouse_fields.winfo_ismapped()
+                assert not hasattr(app, "sales_selector") and not hasattr(app, "edit_button")
+                geometry = root.geometry()
+                toolbar = app.filters.master
+                for width in (1240, 850):
+                    root.geometry(f"{width}x540")
+                    root.update()
+                    assert app.last_month.winfo_ismapped()
+                    assert app.last_month.winfo_rootx() + app.last_month.winfo_width() <= toolbar.winfo_rootx() + toolbar.winfo_width()
+                root.geometry(geometry)
+                root.update()
                 app.warehouse_selector.current(app.warehouse_options.index("Мир"))
                 app.warehouse_selector.event_generate("<<ComboboxSelected>>")
                 root.update()
@@ -920,12 +961,22 @@ def _self_test(marker: Path) -> int:
                 assert app.summary_tree.set("53", "sold_qty") == "5"  # 2 шт. + 3 банки
                 assert app.summary_tree.set("100", "sold_qty") == "1"
 
-                app.sales_selector.current(app.sales_options.index(SalesQuantity.OUTFLOW))
-                app.change_period()
-                assert app.rows[0].product.metrics[:2] == (2, Decimal("9.6")) and not app.month_fields.winfo_manager()
-                app.sales_selector.current(app.sales_options.index(SalesQuantity.MONTHS))
-                app.change_period()
-                assert app.period.sales_months == ("Ноябрь 2026",)
+                def choose_sales_source(source: SalesQuantity) -> None:
+                    with patch.object(app.sales_menu, "tk_popup") as popup:
+                        root.tk.call(app.tree.heading("sold_qty", "command"))
+                        popup.assert_called_once()
+                    option = next(index for index in range(app.sales_menu.index("end") + 1)
+                                  if app.sales_menu.entrycget(index, "value") == source.value)
+                    app.sales_menu.invoke(option)
+                    root.update()
+
+                assert app.tree.heading("sold_qty", "text") == "Продано, шт. ▾"
+                choose_sales_source(SalesQuantity.OUTFLOW)
+                assert app.rows[0].product.metrics[:2] == (2, Decimal("9.6")) and not app.period_fields.winfo_manager()
+                choose_sales_source(SalesQuantity.UNKNOWN)
+                assert app.rows[0].product.metrics[:2] == (None, None) and not app.period_fields.winfo_manager()
+                choose_sales_source(SalesQuantity.MONTHS)
+                assert app.period.sales_months == ("Ноябрь 2026",) and app.period_fields.winfo_ismapped()
 
                 target = base / "warehouse-result.xlsx"
                 with patch.object(filedialog, "asksaveasfilename", return_value=str(target)):

@@ -109,38 +109,53 @@ class GroupSummary:
     sold_amount: Total
     ending_quantity: Total
     ending_amount: Total
+    sold_volume: Total
+    ending_volume: Total
 
     @property
     def metrics(self) -> tuple[Total, ...]:
+        """Четыре базовых показателя, используемые также в экспорте Excel."""
         return self.sold_quantity, self.sold_amount, self.ending_quantity, self.ending_amount
 
 
 def summarize_groups(rows: Iterable[ReportRow]) -> tuple[GroupSummary, ...]:
-    groups: dict[int | None, list[Product]] = defaultdict(list)
+    groups: dict[int | None, list[ReportRow]] = defaultdict(list)
     for row in rows:
-        groups[row.group].append(row.product)
+        groups[row.group].append(row)
     summaries = []
     for group in (*GROUPS, None):
-        products = groups[group]
+        members = groups[group]
+        products = [row.product for row in members]
+        sold_volume = ending_volume = Total(None, 0, len(members))
+        if group in VOLUME_GROUPS:
+            # Складываем произведения по строкам: объём тары у позиций одной группы может отличаться.
+            volumes = [row.volume_values[1:] for row in members]
+            sold_volume = _total(sold for sold, _ in volumes)
+            ending_volume = _total(ending for _, ending in volumes)
         # Количества складываем в единицах ведомости, не делим по единицам и не пересчитываем их.
         summaries.append(GroupSummary(
             group, len(products), _total(p.sold_quantity for p in products), _total(p.sold_amount for p in products),
-            _total(p.ending_quantity for p in products), _total(p.ending_amount for p in products),
+            _total(p.ending_quantity for p in products), _total(p.ending_amount for p in products), sold_volume, ending_volume,
         ))
     return tuple(summaries)
 
 
-def display_number(value: Decimal | None) -> str:
-    return "" if value is None else format(value, "f").replace(".", ",")
+def display_number(value: Decimal | None, *, trim_zeros: bool = False) -> str:
+    if value is None:
+        return ""
+    text = format(value, "f")
+    if trim_zeros and "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text.replace(".", ",")
 
 
-def display_quantity(value: Decimal | None, unit: str) -> str:
-    number = display_number(value)
+def display_quantity(value: Decimal | None, unit: str, *, trim_zeros: bool = False) -> str:
+    number = display_number(value, trim_zeros=trim_zeros)
     return f"{number} {unit}" if number and unit and unit != "шт." else number
 
 
-def display_total(total: Total) -> str:
-    return display_number(total.value) + ("*" if total.partial else "")
+def display_total(total: Total, *, trim_zeros: bool = False) -> str:
+    return display_number(total.value, trim_zeros=trim_zeros) + ("*" if total.partial else "")
 
 
 def _comment(sheet: Worksheet, row: int, col: int, note: str) -> None:

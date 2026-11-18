@@ -4,7 +4,10 @@ import pytest
 from openpyxl import load_workbook
 
 from statistika.catalog import Catalog, RecognitionRule
-from statistika.report import RESULT_COLUMNS, ReportRow, display_number, export_xlsx, refresh_groups
+from statistika.report import (
+    RESULT_COLUMNS, SUMMARY_COLUMNS, ReportRow, display_number, display_quantity, display_total,
+    export_xlsx, in_warehouse, refresh_groups, summarize_groups,
+)
 from statistika.statement import Product
 
 
@@ -55,9 +58,64 @@ def test_manual_clear_remains_blank_and_no_amount_rounding_in_ui():
     assert display_number(None) == ""
 
 
+@pytest.mark.parametrize(("value", "unit", "expected"), [
+    (Decimal("120.00"), "шт.", "120"),
+    (Decimal("1.0200"), "шт.", "1,02"),
+    (Decimal("0.000"), "шт.", "0"),
+    (Decimal("-3.50000"), "м", "-3,5 м"),
+    (Decimal("20.00"), "банка", "20 банка"),
+    (Decimal("1000"), "", "1000"),
+    (None, "шт.", ""),
+])
+def test_stock_quantity_display_trims_only_trailing_fractional_zeros(value, unit, expected):
+    assert display_quantity(value, unit, trim_zeros=True) == expected
+
+
+def test_group_volume_totals_add_per_row_at_selected_warehouse():
+    def row(name, sold, stock, group=40, warehouse="Мир", manual_volume=None):
+        return ReportRow(Product(name, sold, None, stock, None, warehouse, "шт."), group, manual_volume=manual_volume)
+
+    rows = [
+        row("Пиво 0,5л", Decimal(6), Decimal("0.00")),
+        row("Пиво 750мл", Decimal(4), Decimal("2.00"), manual_volume=Decimal("0.25")),
+        row("Пиво без объёма", Decimal(9), Decimal(7)),
+        row("Пиво 1л", None, Decimal(0)),
+        row("Пиво 0,5л", Decimal(100), Decimal(80), warehouse="Кореличи"),
+        row("Вода 1л", Decimal(0), None, group=45),
+        row("Вино без объёма", Decimal(2), Decimal(5), group=35),
+        row("Товар 5л", Decimal(2), Decimal(5), group=46),
+        row("Товар 5л", Decimal(2), Decimal(5), group=None),
+    ]
+    totals = {group.group: group for group in summarize_groups(r for r in rows if in_warehouse(r, "Мир"))}
+    beer = totals[40]
+    assert beer.lines == 4
+    assert beer.sold_volume.value == 4 and beer.sold_volume.known == 2 and beer.sold_volume.partial
+    assert beer.ending_volume.value == Decimal("0.5") and beer.ending_volume.known == 3 and beer.ending_volume.partial
+    assert display_total(beer.sold_volume, trim_zeros=True) == "4*"
+    assert display_total(beer.ending_volume, trim_zeros=True) == "0,5*"
+    assert totals[45].sold_volume.value == 0 and not totals[45].sold_volume.partial
+    assert display_total(totals[45].ending_volume, trim_zeros=True) == ""
+    for group in (35, 36, 46, None):
+        assert all(total.value is None and not total.partial for total in (totals[group].sold_volume, totals[group].ending_volume))
+
+
+def test_volume_totals_do_not_change_excel_layout(tmp_path):
+    row = ReportRow(Product("Пиво 0,5 л", Decimal(12), Decimal(24), Decimal("3.00"), Decimal(6)), 40)
+    target = tmp_path / "Проверка колонок.xlsx"
+    export_xlsx(target, [row], Catalog())
+    workbook = load_workbook(target)
+    try:
+        detail, summary = workbook.worksheets
+        assert detail.max_column == len(RESULT_COLUMNS) == 6
+        assert summary.max_column == len(SUMMARY_COLUMNS) == 6
+        assert tuple(cell.value for cell in summary[5]) == SUMMARY_COLUMNS
+    finally:
+        workbook.close()
+
+
 def test_export_warehouse_scope_and_summary_add_all_units_as_numbers(tmp_path):
     from statistika.catalog import GROUPS, builtin_catalog
-    from statistika.report import summarize_groups, warehouses
+    from statistika.report import warehouses
     from statistika.statement import ReportPeriod
 
     catalog = builtin_catalog()
@@ -107,7 +165,6 @@ def test_export_warehouse_scope_and_summary_add_all_units_as_numbers(tmp_path):
 
 def test_quantity_without_a_unit_counts_but_unknown_values_stay_blank():
     from statistika.catalog import GROUPS
-    from statistika.report import summarize_groups
 
     rows = [ReportRow(Product("Товар", Decimal(7), Decimal(9), None, None), 53)] * 2
     total = summarize_groups(rows)[GROUPS.index(53)]

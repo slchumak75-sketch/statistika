@@ -18,6 +18,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from statistika.catalog import GROUPS, Catalog
 from statistika.classifier import Classifier
 from statistika.statement import Product, ReportPeriod, SOURCE_COLUMNS
+from statistika.volume import VOLUME_GROUPS, find_container_liters
 
 RESULT_COLUMNS = (
     "№ пункта и описание", SOURCE_COLUMNS[0], "Продано за период,\nшт.*", "Продано за период,\nсумма, руб.",
@@ -36,6 +37,20 @@ class ReportRow:
     product: Product
     group: int | None = None
     manual: bool = False
+    manual_volume: Decimal | None = None  # Только в открытой ведомости, отдельно для каждой строки.
+
+    @property
+    def volume_values(self) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+        liters = self.manual_volume if self.manual_volume is not None else find_container_liters(self.product.name)
+        if liters is None or self.group not in VOLUME_GROUPS:
+            return liters, None, None
+        # В колонках «дал.» по требованию отчёта используется произведение без деления на 10.
+        sold, ending = self.product.sold_quantity, self.product.ending_quantity
+        return (
+            liters,
+            sold * liters if sold is not None else None,
+            ending * liters if ending is not None else None,
+        )
 
     def assign(self, group: int | None) -> None:
         if group is not None and group not in GROUPS:

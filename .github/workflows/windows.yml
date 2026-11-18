@@ -38,6 +38,8 @@ jobs:
           }
           $log = Get-Content -LiteralPath $result -Raw
           if ($process.ExitCode -ne 0 -or $log.Trim() -ne 'OK') {
+            $details = $log.Trim().Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Проверка запуска EXE::$details"
             throw "Проверка EXE не пройдена:`n$log"
           }
       - uses: actions/upload-artifact@v7

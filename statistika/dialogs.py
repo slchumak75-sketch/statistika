@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import tkinter as tk
+from dataclasses import replace
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
+from tkinter import messagebox, ttk
 
 from openpyxl.utils.cell import get_column_letter
 
-from statistika.catalog import (
-    GROUPS, PDF_GROUPS, Catalog, CatalogError, RecognitionRule, builtin_catalog, extract_pdf_text, format_points, parse_points, save_catalog,
-)
+from statistika.catalog import Catalog, save_catalog
 from statistika.rule_editor import RuleEditor
 from statistika.statement import SOURCE_COLUMNS, ImportedProducts, ImportPlan, Sheet, StatementError, column_headers, import_products
 
@@ -55,156 +53,28 @@ def _short(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
-def _set_text(widget: tk.Text, text: str) -> None:
-    widget.delete("1.0", "end")
-    widget.insert("1.0", text)
-    widget.edit_reset()
-
-
 class CatalogDialog(Modal):
     def __init__(self, parent: tk.Misc, catalog: Catalog, path: Path) -> None:
         super().__init__(parent, "Справочник товарных групп")
         self.original = catalog
         self.path = path
-        self.source = catalog.source
-        self.rules = dict(catalog.rules)
-        self.editing_group = GROUPS[0]
         self.result: Catalog | None = None
-        self.minsize(770, 540)
+        self.geometry("750x520")
+        self.minsize(650, 360)
         body = self.body()
-        body.rowconfigure(1, weight=1)
-        ttk.Label(body, text="Справочник товарных групп", style="DialogTitle.TLabel").grid(row=0, sticky="w", pady=(0, 12))
-        tabs = ttk.Notebook(body)
-        tabs.grid(row=1, sticky="nsew")
-        points = ttk.Frame(tabs, padding=12)
-        rules = ttk.Frame(tabs, padding=12)
-        tabs.add(points, text="Пункты PDF")
-        tabs.add(rules, text="Правила распознавания")
-
-        toolbar = ttk.Frame(points)
-        toolbar.pack(fill="x", pady=(0, 8))
-        ttk.Button(toolbar, text="Загрузить PDF…", command=self.open_pdf).pack(side="left")
-        ttk.Button(toolbar, text="Встроенный справочник", command=self.restore_points).pack(side="left", padx=(7, 0))
-        self.source_text = tk.StringVar(value=self.source or "PDF не загружен")
-        ttk.Label(toolbar, textvariable=self.source_text).pack(side="left", padx=10)
-        ttk.Label(
-            points, wraplength=675, text="Сверьте текст с PDF. Формат: «35. Описание». "
-            "Можно исправить извлечение или ввести точный текст вручную. Справочник запоминает все внесённые пункты.",
-        ).pack(anchor="w", pady=(0, 8))
-        self.points_text = ScrolledText(points, width=79, height=15, wrap="word", undo=True, font="TkDefaultFont")
-        self.points_text.pack(fill="both", expand=True)
-        _set_text(self.points_text, format_points(catalog.points))
-        count = len(PDF_GROUPS)
-        self.note = tk.StringVar(value=f"Доступно пунктов PDF из требуемых: {count - len(catalog.missing)} из {count}. №100 встроен.")
-        ttk.Label(points, textvariable=self.note, wraplength=675, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
-
-        choice = ttk.Frame(rules)
-        choice.pack(fill="x")
-        ttk.Label(choice, text="Группа").pack(side="left")
-        self.rule_group = ttk.Combobox(choice, width=42, state="readonly", values=[
-            _short(catalog.short_label(number), 58) for number in GROUPS
-        ])
-        self.rule_group.current(0)
-        self.rule_group.pack(side="left", padx=8)
-        self.rule_group.bind("<<ComboboxSelected>>", self._switch_rule)
-        ttk.Button(choice, text="Исходные фразы", command=self.restore_rule).pack(side="right")
-        self.rule_description = tk.StringVar()
-        ttk.Label(rules, textvariable=self.rule_description, wraplength=675, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
-        ttk.Label(
-            rules, wraplength=705, text="Выберите строку, чтобы изменить или удалить правило. "
-            "Для дополнительных условий введите по одной фразе на строку.",
-        ).pack(anchor="w", pady=8)
-        self.rule_editor = RuleEditor(rules, self._update_rules)
-        self.rule_editor.pack(fill="both", expand=True)
-        self._load_rule()
-        tabs.bind("<<NotebookTabChanged>>", lambda _event: self._load_rule() if tabs.select() == str(rules) else None)
-        self.footer(body, 2, "Сохранить справочник", self.save)
-
-    def restore_points(self) -> None:
-        if not messagebox.askyesno(
-            "Восстановить пункты?", "Заменить описания встроенным текстом 4-торг? Ваши правила останутся.", parent=self,
-        ):
-            return
-        catalog = builtin_catalog()
-        self.source = catalog.source
-        self.source_text.set(self.source)
-        _set_text(self.points_text, format_points(catalog.points))
-        self.note.set(f"Встроенный справочник: {len(catalog.points)} пунктов. Нажмите «Сохранить справочник».")
-
-    def open_pdf(self) -> None:
-        name = filedialog.askopenfilename(parent=self, title="Выберите справочник PDF", filetypes=[("PDF", "*.pdf")])
-        if not name:
-            return
-        self.configure(cursor="watch")
-        self.update_idletasks()
-        try:
-            text, blank_pages = extract_pdf_text(Path(name))
-        except (CatalogError, OSError) as error:
-            messagebox.showerror("Не удалось загрузить PDF", str(error), parent=self)
-            return
-        finally:
-            self.configure(cursor="")
-        if self.points_text.get("1.0", "end-1c").strip() and not messagebox.askyesno(
-            "Заменить пункты?", "Извлечённый текст заменит пункты в редакторе. Правила останутся. Продолжить?", parent=self,
-        ):
-            return
-        self.source = Path(name).name
-        self.source_text.set(self.source)
-        try:
-            points = parse_points(text)
-        except CatalogError as error:
-            points = {}
-            note = str(error)
-        else:
-            note = f"Извлечено пунктов: {len(points)}. Сверьте данные с PDF."
-            if not points:
-                note = "Нумерация не распознана. Исправьте текст так, чтобы каждый пункт начинался с «35. Описание»."
-        _set_text(self.points_text, format_points(points) if points else text)
-        if blank_pages:
-            note += f" Страниц без текста: {blank_pages}."
-        self.note.set(note)
-
-    def _update_rules(self, entries: tuple[RecognitionRule, ...]) -> None:
-        self.rules[self.editing_group] = entries
-
-    def _draft(self) -> Catalog:
-        try:
-            points = parse_points(self.points_text.get("1.0", "end-1c"))
-        except CatalogError:
-            points = self.original.points
-        return Catalog(points, self.rules, self.source)
-
-    def _load_rule(self) -> None:
-        catalog = self._draft()
-        self.rule_editor.load(catalog.recognition_rules(self.editing_group))
-        self.rule_description.set(_short(catalog.label(self.editing_group), 320))
-
-    def _switch_rule(self, _event=None) -> None:
-        self.editing_group = GROUPS[self.rule_group.current()]
-        self._load_rule()
-
-    def restore_rule(self) -> None:
-        if messagebox.askyesno(
-            "Восстановить фразы?", "Заменить правила выбранной группы исходным списком?", parent=self,
-        ):
-            self.rules.pop(self.editing_group, None)
-            self._load_rule()
+        body.rowconfigure(0, weight=1)
+        self.rule_editor = RuleEditor(body, catalog)
+        self.rule_editor.grid(row=0, sticky="nsew")
+        self.save_button = ttk.Button(body, text="Сохранить справочник", style="Accent.TButton", command=self.save)
+        self.save_button.grid(row=1, sticky="e", pady=(12, 0))
 
     def save(self) -> None:
-        text = self.points_text.get("1.0", "end-1c")
+        if not self.rule_editor.include_phrase():
+            return
+        catalog = replace(self.original, rules=dict(self.rule_editor.rules))
         try:
-            points = parse_points(text)
-            if text.strip() and not points:
-                raise CatalogError("Не найдено ни одного пункта. Нужны строки вида «35. Описание».")
-            catalog = Catalog(points, self.rules, self.source if points else "")
-            if catalog.missing and (points != self.original.points or self.source != self.original.source):
-                missing = ", ".join(map(str, catalog.missing))
-                if not messagebox.askyesno(
-                    "Неполный справочник", f"Нет описаний пунктов: {missing}.\nСохранить как есть?", parent=self,
-                ):
-                    return
             save_catalog(catalog, self.path)
-        except (CatalogError, OSError) as error:
+        except OSError as error:
             messagebox.showerror("Не удалось сохранить справочник", str(error), parent=self)
             return
         self.result = catalog

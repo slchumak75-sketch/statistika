@@ -246,7 +246,7 @@ class MainWindow:
             self.classify()
             self.update_catalog_summary()
             self.redraw(keep_position=True)
-            self.export_text.set(f"Справочник сохранён. Пунктов PDF в памяти: {len(self.catalog.points)}. Ручные назначения сохранены.")
+            self.export_text.set("Справочник сохранён. Ручные назначения сохранены.")
 
     def open_statement(self) -> None:
         filename = filedialog.askopenfilename(
@@ -600,43 +600,52 @@ def _self_test(marker: Path) -> int:
                 app = MainWindow(root, catalog_path)
                 errors: list[str] = []
                 root.report_callback_exception = lambda *exc: errors.append("".join(traceback.format_exception(*exc)))
+                root.deiconify()
+                root.update()
                 catalog_editor = CatalogDialog(root, app.catalog, catalog_path)
+                catalog_editor.deiconify()
+                root.update()
                 editor = catalog_editor.rule_editor
-                for index, number in enumerate(GROUPS):
-                    catalog_editor.rule_group.current(index)
-                    catalog_editor._switch_rule()
-                    assert tuple(editor.rules) == app.catalog.recognition_rules(number)
-                    assert editor.rules
-                    assert all(not any(marker in editor.tree.set(item, "phrase") for marker in ("^", "!", " + ", "#"))
-                               for item in editor.tree.get_children())
-                catalog_editor.rule_group.current(GROUPS.index(53))
-                catalog_editor._switch_rule()
-                assert RecognitionRule("антисептик", at_start=True) in editor.rules
-                assert any(rule.exclude for rule in editor.rules)
-                assert RecognitionRule("автомат ва 47", at_start=True) in editor.rules
+                assert editor.tree["columns"] == ("enabled", "phrase", "delete")
+                editor.query.set("ГЕЛЬ")
+                assert {"57", "63"} <= {item.split(":")[0] for item in editor.tree.get_children()}
+
+                def click_phrase(item: str, column: str) -> None:
+                    editor.tree.see(item)
+                    root.update()
+                    x, y, width, height = editor.tree.bbox(item, column)
+                    editor.tree.event_generate("<ButtonRelease-1>", x=x + width // 2, y=y + height // 2)
+                    root.update()
+
+                original_rule = RecognitionRule("шпатель", at_start=True, also=("фасадный",))
+                index = app.catalog.recognition_rules(53).index(original_rule)
+                rule_item = f"53:{index}"
+                editor.query.set("ШПАТЕЛЬ ФАСАДНЫЙ")
+                assert editor.tree.set(rule_item, "enabled") == "☑"
+                click_phrase(rule_item, "enabled")
+                assert editor.tree.set(rule_item, "enabled") == "☐" and editor.rules[53][index].disabled
+
+                editor.group.current(1 + GROUPS.index(53))
                 editor.phrase.insert(0, "Пробная фраза CI")
-                editor.position.current(1)
-                editor.add()
-                assert editor.rules[-1] == RecognitionRule("Пробная фраза CI", at_start=True)
-                editor.phrase.delete(0, "end")
-                editor.phrase.insert(0, "Проверка фразы CI")
-                editor.also.insert("1.0", "уточнение")
-                editor.change()
-                assert editor.rules[-1] == RecognitionRule("Проверка фразы CI", at_start=True, also=("уточнение",))
-                editor.phrase.delete(0, "end")
+                editor.include_button.invoke()
+                assert editor.rules[53][-1] == RecognitionRule("Пробная фраза CI")
                 editor.phrase.insert(0, "Временная фраза CI")
-                editor.add()
-                editor.delete()
-                catalog_editor.save()
-                assert load_catalog(catalog_path).rules[53][-1] == RecognitionRule(
-                    "Проверка фразы CI", at_start=True, also=("уточнение",),
-                )
+                editor.include_button.invoke()
+                temporary = f"53:{len(editor.rules[53]) - 1}"
+                assert editor.tree.set(temporary, "delete") == "Удалить"
+                click_phrase(temporary, "delete")
+                assert not editor.tree.exists(temporary) and editor.rules[53][-1] == RecognitionRule("Пробная фраза CI")
+                catalog_editor.save_button.invoke()
+                saved = load_catalog(catalog_path)
+                assert saved == catalog_editor.result
+                assert saved.points == app.catalog.points and saved.source == app.catalog.source
+                assert saved.rules[53][index] == RecognitionRule("шпатель", at_start=True, also=("фасадный",), disabled=True)
+                assert saved.rules[53][-1] == RecognitionRule("Пробная фраза CI")
 
                 assert len(app.catalog.points) == 74 and not app.catalog.missing
                 with patch.object(ColumnMappingDialog, "show", side_effect=AssertionError("Лишнее окно сопоставления")):
                     app.open_path(statement)
                 assert not app.period_fields.winfo_manager()
-                root.deiconify()
                 root.update()
                 assert [row.group for row in app.rows] == [100, None]
                 assert len(app.tree.get_children()) == 2

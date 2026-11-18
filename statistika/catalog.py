@@ -55,6 +55,7 @@ class RecognitionRule:
     exclude: bool = False
     also: tuple[str, ...] = ()
     also_at_start: tuple[str, ...] = ()
+    disabled: bool = False
 
 
 def _legacy_rule(line: str) -> RecognitionRule | None:
@@ -77,8 +78,8 @@ def _read_rule(value: object) -> RecognitionRule:
         raise ValueError("некорректная фраза распознавания")
     phrase = clean_phrase(value["phrase"])
     # Старый флажок internal_only из v3 больше не ограничивает действие фразы.
-    at_start, exclude = (value.get(key, False) for key in ("at_start", "exclude"))
-    if not any(ch.isalnum() for ch in phrase) or not all(isinstance(flag, bool) for flag in (at_start, exclude)):
+    at_start, exclude, disabled = (value.get(key, False) for key in ("at_start", "exclude", "disabled"))
+    if not any(ch.isalnum() for ch in phrase) or not all(isinstance(flag, bool) for flag in (at_start, exclude, disabled)):
         raise ValueError("некорректные поля правила")
 
     def extras(key: str) -> tuple[str, ...]:
@@ -87,7 +88,7 @@ def _read_rule(value: object) -> RecognitionRule:
             raise ValueError("некорректные уточнения правила")
         return tuple(clean_phrase(p) for p in phrases)
 
-    return RecognitionRule(phrase, at_start, exclude, extras("also"), extras("also_at_start"))
+    return RecognitionRule(phrase, at_start, exclude, extras("also"), extras("also_at_start"), disabled)
 
 
 def _write_rule(rule: RecognitionRule) -> dict[str, object]:

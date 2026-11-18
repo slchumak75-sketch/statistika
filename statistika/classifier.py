@@ -77,7 +77,7 @@ class Classifier:
         by_word: dict[str, set[Rule]] = defaultdict(set)
         for group in GROUPS:
             for entry in catalog.recognition_rules(group):
-                if rule := _rule(entry, group):
+                if not entry.disabled and (rule := _rule(entry, group)):
                     by_word[rule.first.words[0]].add(rule)
         self._by_word = dict(by_word)
 

@@ -1,166 +1,158 @@
-"""Редактор фраз: способ совпадения и исключения — поля, а не разметка текста."""
+"""Поиск, включение и удаление фраз справочника."""
 
 from __future__ import annotations
 
 import tkinter as tk
+import unicodedata
+from dataclasses import replace
 from tkinter import messagebox, ttk
-from typing import Callable
 
-from statistika.catalog import RecognitionRule, clean_phrase
+from statistika.catalog import GROUPS, Catalog, RecognitionRule, clean_phrase
 
-_POSITIONS = ("В названии", "В начале")
-_ACTIONS = ("Назначить", "Исключить")
+
+def _search_key(text: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", text).casefold().replace("ё", "е").split())
+
+
+def _terms(rule: RecognitionRule) -> tuple[str, ...]:
+    return rule.phrase, *rule.also, *rule.also_at_start
+
+
+def _check(rule: RecognitionRule) -> str:
+    return "☐" if rule.disabled else "☑"
 
 
 class RuleEditor(ttk.Frame):
-    def __init__(self, parent: tk.Misc, on_change: Callable[[tuple[RecognitionRule, ...]], None]) -> None:
+    def __init__(self, parent: tk.Misc, catalog: Catalog) -> None:
         super().__init__(parent)
-        self.on_change = on_change
-        self.rules: list[RecognitionRule] = []
+        self.catalog = catalog
+        self.rules = dict(catalog.rules)
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=1)
 
         search = ttk.Frame(self)
-        search.grid(row=0, columnspan=2, sticky="ew", pady=(0, 6))
-        ttk.Label(search, text="Поиск по фразам").pack(side="left", padx=(0, 6))
+        search.grid(row=0, columnspan=2, sticky="ew", pady=(0, 8))
+        ttk.Label(search, text="Поиск по фразам").pack(side="left", padx=(0, 8))
         self.query = tk.StringVar(master=self)
-        ttk.Entry(search, textvariable=self.query, width=36).pack(side="left")
-        self.count = ttk.Label(search, style="Muted.TLabel")
-        self.count.pack(side="right")
-        self.query.trace_add("write", lambda *_: self._refresh())
-
-        self.tree = ttk.Treeview(self, columns=("phrase", "position", "action", "details"), show="headings",
-                                 selectmode="browse", height=8)
-        for name, title, width in zip(self.tree["columns"],
-                                      ("Фраза", "Где искать", "Действие", "Также должно встретиться"),
-                                      (250, 105, 130, 225)):
-            self.tree.heading(name, text=title, anchor="w")
-            self.tree.column(name, width=width, minwidth=90, stretch=name in ("phrase", "details"))
-        self.tree.grid(row=1, column=0, sticky="nsew")
-        sy = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        sy.grid(row=1, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=sy.set)
-        self.tree.bind("<<TreeviewSelect>>", self._selected)
-        self.tree.bind("<Delete>", self.delete)
+        ttk.Entry(search, textvariable=self.query).pack(side="left", fill="x", expand=True)
 
         form = ttk.Frame(self)
-        form.grid(row=2, columnspan=2, sticky="ew", pady=(8, 4))
+        form.grid(row=1, columnspan=2, sticky="ew", pady=(0, 10))
         form.columnconfigure(0, weight=1)
-        ttk.Label(form, text="Фраза").grid(row=0, column=0, sticky="w")
+        ttk.Label(form, text="Включить фразу").grid(row=0, column=0, sticky="w", pady=(0, 3))
         self.phrase = ttk.Entry(form)
         self.phrase.grid(row=1, column=0, sticky="ew", padx=(0, 8))
-        ttk.Label(form, text="Где искать").grid(row=0, column=1, sticky="w")
-        self.position = ttk.Combobox(form, values=_POSITIONS, state="readonly", width=16)
-        self.position.grid(row=1, column=1, sticky="w", padx=(0, 8))
-        ttk.Label(form, text="Действие").grid(row=0, column=2, sticky="w")
-        self.action = ttk.Combobox(form, values=_ACTIONS, state="readonly", width=15)
-        self.action.grid(row=1, column=2, sticky="w")
+        self.phrase.bind("<Return>", self._enter_phrase)
+        labels = tuple(catalog.short_label(number) for number in GROUPS)
+        self.group = ttk.Combobox(form, state="readonly", width=29, values=(
+            "Выберите группу", *(label if len(label) <= 46 else label[:45] + "…" for label in labels),
+        ))
+        self.group.current(0)
+        self.group.grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        self.include_button = ttk.Button(form, text="Включить", command=self.include_phrase)
+        self.include_button.grid(row=1, column=2, sticky="e")
 
-        details = ttk.Frame(self)
-        details.grid(row=3, columnspan=2, sticky="ew")
-        self.also = self._text_field(details, "Также в названии (если нужно)", 0)
-        self.also_at_start = self._text_field(details, "Также в начале (если нужно)", 1)
+        self.tree = ttk.Treeview(self, columns=("enabled", "phrase", "delete"), show="", selectmode="browse", height=14)
+        self.tree.column("enabled", width=36, minwidth=36, anchor="center", stretch=False)
+        self.tree.column("phrase", width=450, minwidth=220, anchor="w")
+        self.tree.column("delete", width=90, minwidth=90, anchor="center", stretch=False)
+        self.tree.tag_configure("group", background="#e0eaf5", font=("Segoe UI", 9, "bold"))
+        self.tree.tag_configure("disabled", foreground="#617488")
+        self.tree.grid(row=2, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        scroll.grid(row=2, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.bind("<ButtonRelease-1>", self._click)
+        self.tree.bind("<space>", self._toggle_selected)
+        self.tree.bind("<Delete>", self._delete_selected)
+        self.query.trace_add("write", lambda *_: self._refresh())
+        self._refresh()
 
-        buttons = ttk.Frame(self)
-        buttons.grid(row=4, columnspan=2, sticky="ew", pady=(6, 0))
-        ttk.Button(buttons, text="Добавить", command=self.add).pack(side="left")
-        self.change_button = ttk.Button(buttons, text="Изменить", command=self.change)
-        self.change_button.pack(side="left", padx=6)
-        self.delete_button = ttk.Button(buttons, text="Удалить", command=self.delete)
-        self.delete_button.pack(side="left")
-        ttk.Button(buttons, text="Очистить список…", command=self.clear).pack(side="right")
-        self._fill(RecognitionRule(""))
-        self._selected()
+    def _rules_for(self, number: int) -> tuple[RecognitionRule, ...]:
+        return self.rules[number] if number in self.rules else self.catalog.recognition_rules(number)
 
-    @staticmethod
-    def _text_field(parent: ttk.Frame, label: str, column: int) -> tk.Text:
-        ttk.Label(parent, text=label, style="Muted.TLabel").grid(row=0, column=column, sticky="w")
-        parent.columnconfigure(column, weight=1)
-        field = tk.Text(parent, height=2, width=24, wrap="word", font="TkDefaultFont")
-        field.grid(row=1, column=column, sticky="ew", padx=(0, 6) if column == 0 else 0)
-        return field
+    def _refresh(self, *, keep_position: bool = False, selected: str = "") -> None:
+        tree = self.tree
+        position = tree.yview()[0] if keep_position else 0.0
+        query = _search_key(self.query.get())
+        tree.delete(*tree.get_children())
+        count = 0
+        for number in GROUPS:
+            title_added = False
+            for index, rule in enumerate(self._rules_for(number)):
+                terms = _terms(rule)
+                if query and query not in _search_key(" ".join(terms)):
+                    continue
+                if not title_added:
+                    tree.insert("", "end", values=("", self.catalog.short_label(number), ""), tags=("group",))
+                    title_added = True
+                label = " · ".join(terms) + (" (исключение)" if rule.exclude else "")
+                tree.insert("", "end", iid=f"{number}:{index}", values=(_check(rule), label, "Удалить"),
+                            tags=("disabled",) if rule.disabled else ())
+                count += 1
+        if not count:
+            tree.insert("", "end", values=("", "Фразы не найдены", ""))
+        if selected and tree.exists(selected):
+            tree.selection_set(selected)
+            tree.focus(selected)
+            tree.see(selected)
+        else:
+            tree.yview_moveto(position)
 
-    def load(self, rules: tuple[RecognitionRule, ...]) -> None:
-        self.rules = list(rules)
-        self.query.set("")
-        self._fill(RecognitionRule(""))
+    def _enter_phrase(self, _event) -> str:
+        self.include_phrase()
+        return "break"
 
-    def _refresh(self, selected: int | None = None) -> None:
-        self.tree.delete(*self.tree.get_children())
-        query = self.query.get().strip().casefold().replace("ё", "е")
-        shown = 0
-        for index, rule in enumerate(self.rules):
-            extra = "; ".join((*rule.also, *(p + " (в начале)" for p in rule.also_at_start)))
-            values = rule.phrase, _POSITIONS[rule.at_start], _ACTIONS[rule.exclude], extra
-            if query not in " ".join(values).casefold().replace("ё", "е"):
-                continue
-            self.tree.insert("", "end", iid=str(index), values=values)
-            shown += 1
-        if selected is not None and self.tree.exists(str(selected)):
-            self.tree.selection_set(str(selected))
-            self.tree.see(str(selected))
-        self.count.configure(text=f"Правил: {shown} из {len(self.rules)}")
-        self._selected()
-
-    def _index(self) -> int | None:
-        selection = self.tree.selection()
-        return int(selection[0]) if selection else None
-
-    def _selected(self, _event=None) -> None:
-        index = self._index()
-        for button in (self.change_button, self.delete_button):
-            button.state(["disabled" if index is None else "!disabled"])
-        if index is not None:
-            self._fill(self.rules[index])
-
-    def _fill(self, rule: RecognitionRule) -> None:
+    def include_phrase(self) -> bool:
+        raw_phrase = self.phrase.get()
+        if not raw_phrase.strip():
+            return True
+        phrase = clean_phrase(raw_phrase)
+        selection = self.group.current()
+        if not any(ch.isalnum() for ch in phrase) or selection <= 0:
+            messagebox.showwarning("Включить фразу", "Введите фразу с буквами или цифрами и выберите её группу.", parent=self)
+            return False
+        number = GROUPS[selection - 1]
+        rules = list(self._rules_for(number))
+        key = _search_key(phrase)
+        index = next((i for i, rule in enumerate(rules) if not rule.exclude and key == _search_key(" ".join(_terms(rule)))), None)
+        if index is None:
+            index = len(rules)
+            rules.append(RecognitionRule(phrase))
+        elif rules[index].disabled:
+            rules[index] = replace(rules[index], disabled=False)
+        self.rules[number] = tuple(rules)
         self.phrase.delete(0, "end")
-        self.phrase.insert(0, rule.phrase)
-        self.position.current(int(rule.at_start))
-        self.action.current(int(rule.exclude))
-        for field, phrases in ((self.also, rule.also), (self.also_at_start, rule.also_at_start)):
-            field.delete("1.0", "end")
-            field.insert("1.0", "\n".join(phrases))
+        if _search_key(self.query.get()) not in key:
+            self.query.set(phrase)
+        self._refresh(selected=f"{number}:{index}")
+        return True
 
-    def _read(self) -> RecognitionRule | None:
-        phrase = clean_phrase(self.phrase.get())
-        also, starts = (
-            tuple(dict.fromkeys(p for line in field.get("1.0", "end-1c").splitlines() if (p := clean_phrase(line))))
-            for field in (self.also, self.also_at_start)
-        )
-        if not all(any(ch.isalnum() for ch in value) for value in (phrase, *also, *starts)):
-            messagebox.showwarning("Правило распознавания", "Укажите фразу с буквами или цифрами.", parent=self)
-            return None
-        return RecognitionRule(phrase, self.position.current() == 1, self.action.current() == 1, also, starts)
+    def _edit_row(self, item: str, *, delete: bool) -> None:
+        if ":" not in item:
+            return  # Не строка фразы: название группы или пустой результат поиска.
+        number, index = map(int, item.split(":"))
+        rules = list(self._rules_for(number))
+        if delete:
+            del rules[index]
+        else:
+            rule = rules[index] = replace(rules[index], disabled=not rules[index].disabled)
+            self.tree.set(item, "enabled", _check(rule))
+            self.tree.item(item, tags=("disabled",) if rule.disabled else ())
+        self.rules[number] = tuple(rules)
+        if delete:
+            self._refresh(keep_position=True)
 
-    def _commit(self, selected: int | None = None) -> None:
-        self.on_change(tuple(self.rules))
-        self._refresh(selected)
+    def _click(self, event) -> None:
+        item = self.tree.identify_row(event.y)
+        column = self.tree.identify_column(event.x)
+        if column in ("#1", "#3"):
+            self._edit_row(item, delete=column == "#3")
 
-    def add(self) -> None:
-        if rule := self._read():
-            if rule not in self.rules:
-                self.rules.append(rule)
-                self._commit(len(self.rules) - 1)
-            else:
-                self._refresh(self.rules.index(rule))
+    def _toggle_selected(self, _event) -> str:
+        self._edit_row(next(iter(self.tree.selection()), ""), delete=False)
+        return "break"
 
-    def change(self) -> None:
-        if (index := self._index()) is not None and (rule := self._read()):
-            self.rules[index] = rule
-            self._commit(index)
-
-    def delete(self, _event=None) -> None:
-        if (index := self._index()) is not None:
-            del self.rules[index]
-            self._commit(min(index, len(self.rules) - 1) if self.rules else None)
-            if not self.rules:
-                self._fill(RecognitionRule(""))
-
-    def clear(self) -> None:
-        if self.rules and messagebox.askyesno(
-            "Очистить список?", "Автоназначение для этой группы будет отключено после сохранения.", parent=self,
-        ):
-            self.rules.clear()
-            self._commit()
-            self._fill(RecognitionRule(""))
+    def _delete_selected(self, _event) -> str:
+        self._edit_row(next(iter(self.tree.selection()), ""), delete=True)
+        return "break"

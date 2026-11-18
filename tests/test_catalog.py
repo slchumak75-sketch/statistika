@@ -196,3 +196,43 @@ def test_legacy_v3_flag_is_ignored_without_losing_saved_recognition_conditions(t
     save_catalog(catalog, path)
     assert "internal_only" not in path.read_text(encoding="utf-8")
     assert load_catalog(path) == catalog
+
+
+def test_unchecked_phrases_stay_saved_but_do_not_classify(tmp_path):
+    from dataclasses import replace
+
+    from statistika.classifier import Classifier
+
+    base = builtin_catalog()
+    positive = RecognitionRule("шпатель", at_start=True, also=("фасадный",))
+    exception = RecognitionRule("игрушечный", exclude=True)
+    catalog = replace(base, rules={53: (replace(positive, disabled=True), exception), 100: ()})
+    path = tmp_path / "catalog.json"
+    save_catalog(catalog, path)
+    saved = load_catalog(path)
+    assert saved == catalog and saved.points == base.points
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["rules"]["53"][0] == {
+        "phrase": "шпатель", "at_start": True, "also": ["фасадный"], "disabled": True,
+    }
+    assert "disabled" not in data["rules"]["53"][1]
+    assert Classifier(saved).group_for("Шпатель фасадный") is None
+    assert Classifier(saved).group_for("Американка 1/2 Kalde") is None  # Не восстанавливать встроенные фразы.
+    assert Classifier(saved).group_for("Носки") is None
+
+    enabled = replace(saved, rules={53: (replace(saved.rules[53][0], disabled=False), exception)})
+    assert Classifier(enabled).group_for("Шпатель фасадный") == 53
+    assert Classifier(enabled).group_for("Ручка, шпатель фасадный") is None
+    assert Classifier(enabled).group_for("Шпатель фасадный игрушечный") is None
+    no_exception = replace(enabled, rules={53: (positive, replace(exception, disabled=True))})
+    assert Classifier(no_exception).group_for("Шпатель фасадный игрушечный") == 53
+
+
+def test_saved_phrase_checkbox_must_be_boolean(tmp_path):
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps({
+        "version": 3, "points": builtin_catalog().points,
+        "rules": {"53": [{"phrase": "антисептик", "disabled": "false"}]},
+    }), encoding="utf-8")
+    with pytest.raises(CatalogError, match="некорректные поля правила"):
+        load_catalog(path)
